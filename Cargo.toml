@@ -1,5 +1,5 @@
 [package]
-name = "argenus"
+name = "ARGenus"
 version = "0.1.0"
 edition = "2021"
 description = "ARG detection and genus-level classification using flanking sequence analysis"
