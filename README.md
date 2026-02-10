@@ -145,6 +145,27 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+<table>
+  <tbody>
+    <tr>
+      <td align="center">
+        <a href="https://github.com/GNWEE">
+          <img src="https://github.com/GNWEE.png" width="100px;" alt=""/><br />
+          <sub><b>GNWEE</b></sub>
+        </a>
+      </td>
+      <td align="center">
+        <a href="https://github.com/kyuwon-shim-ARL">
+          <img src="https://github.com/kyuwon-shim-ARL.png" width="100px;" alt=""/><br />
+          <sub><b>kyuwon-shim-ARL</b></sub>
+        </a>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
 ## Contact
+
+[Sunju Kim](n.e.coli.1822@gmail.com)
 
 For questions and feedback, please open an issue on GitHub.
