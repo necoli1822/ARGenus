@@ -149,8 +149,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
   <tbody>
     <tr>
       <td align="center">
-        <a href="https://github.com/GNWEE">
-          <img src="https://github.com/GNWEE.png" width="100px;" alt=""/><br />
+        <a href="https://github.com/guinamwee">
+          <img src="https://github.com/guinamwee.png" width="100px;" alt=""/><br />
           <sub><b>GNWEE</b></sub>
         </a>
       </td>
