@@ -26,6 +26,10 @@ pub struct ArgPosition {
     pub arg_end: usize,
 
     pub strand: char,
+
+    pub ref_start: usize,
+
+    pub ref_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -283,8 +287,8 @@ impl GenusClassifier {
         let snp_status = snp::verify_snp(
             &pos.contig_seq,
             &pos.arg_name,
-            0,
-            pos.arg_end - pos.arg_start,
+            pos.ref_start,
+            pos.ref_end,
             pos.arg_start,
             pos.arg_end,
             pos.strand,
@@ -333,11 +337,11 @@ impl GenusClassifier {
             });
         }
 
-        let temp_dir = std::env::temp_dir();
-        let pid = std::process::id();
-        let query_path = temp_dir.join(format!("argenus_query_{}.fas", pid));
-        let ref_path = temp_dir.join(format!("argenus_ref_{}.fas", pid));
-        let paf_path = temp_dir.join(format!("argenus_align_{}.paf", pid));
+        let temp_dir = tempfile::tempdir()
+            .context("Failed to create temp directory")?;
+        let query_path = temp_dir.path().join("query.fas");
+        let ref_path = temp_dir.path().join("ref.fas");
+        let paf_path = temp_dir.path().join("align.paf");
 
         {
             let mut query_file = BufWriter::new(File::create(&query_path)?);
@@ -366,7 +370,7 @@ impl GenusClassifier {
         }
 
         let output = Command::new(&self.minimap2_path)
-            .args(["-x", "sr", "-t", &threads.to_string(), "-c", "--secondary=yes", "-N", "100", "-k", "15", "-w", "5"])
+            .args(["-x", "asm20", "-t", &threads.to_string(), "-c", "--secondary=yes", "-N", "100", "-k", "15", "-w", "5"])
             .arg(&ref_path)
             .arg(&query_path)
             .arg("-o").arg(&paf_path)
@@ -375,10 +379,6 @@ impl GenusClassifier {
             .context("Failed to run minimap2")?;
 
         if !output.status.success() {
-
-            let _ = std::fs::remove_file(&query_path);
-            let _ = std::fs::remove_file(&ref_path);
-            let _ = std::fs::remove_file(&paf_path);
 
             return Ok(GenusResult {
                 arg_name: pos.arg_name.clone(),
@@ -395,10 +395,6 @@ impl GenusClassifier {
 
         let genus_scores = self.calculate_genus_scores(&paf_path)?;
 
-        let _ = std::fs::remove_file(&query_path);
-        let _ = std::fs::remove_file(&ref_path);
-        let _ = std::fs::remove_file(&paf_path);
-
         let genus_dist = self.db.get_genus_distribution(&pos.arg_name)?;
         let total_in_db: usize = genus_dist.values().sum();
 
@@ -406,6 +402,7 @@ impl GenusClassifier {
         sorted_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let (genus, confidence, specificity) = if let Some((best_genus, best_score)) = sorted_scores.first() {
+            // Database prevalence: fraction of DB entries for this gene belonging to this genus
             let genus_count = genus_dist.get(best_genus).copied().unwrap_or(0);
             let specificity = if total_in_db > 0 {
                 (genus_count as f64 / total_in_db as f64) * 100.0
@@ -452,11 +449,7 @@ impl GenusClassifier {
             String::new()
         };
 
-        if pos.strand == '-' {
-            (reverse_complement(&downstream), reverse_complement(&upstream))
-        } else {
-            (upstream, downstream)
-        }
+        (upstream, downstream)
     }
 
     fn calculate_genus_scores(&self, paf_path: &Path) -> Result<FxHashMap<String, f64>> {
@@ -504,7 +497,7 @@ impl GenusClassifier {
 
             let avg_identity = scores.iter().sum::<f64>() / scores.len() as f64;
             let count_bonus = (scores.len() as f64).ln().max(1.0);
-            genus_scores.insert(genus, avg_identity * count_bonus / count_bonus.max(1.0));
+            genus_scores.insert(genus, avg_identity * count_bonus);
         }
 
         Ok(genus_scores)
@@ -512,34 +505,31 @@ impl GenusClassifier {
 
 }
 
-fn reverse_complement(seq: &str) -> String {
-    seq.chars()
-        .rev()
-        .map(|c| match c.to_ascii_uppercase() {
-            'A' => 'T',
-            'T' => 'A',
-            'G' => 'C',
-            'C' => 'G',
-            _ => 'N',
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_reverse_complement() {
-        assert_eq!(reverse_complement("ATGC"), "GCAT");
-        assert_eq!(reverse_complement("AAAA"), "TTTT");
-        assert_eq!(reverse_complement(""), "");
-    }
 
     #[test]
     fn test_genus_result_default() {
         let result = GenusResult::default();
         assert!(result.genus.is_none());
         assert_eq!(result.confidence, 0.0);
+    }
+
+    #[test]
+    fn test_genus_scoring_count_bonus() {
+        let avg_a = 95.0_f64;
+        let count_a = 10_usize;
+        let bonus_a = (count_a as f64).ln().max(1.0);
+        let score_a = avg_a * bonus_a;
+
+        let avg_b = 96.0_f64;
+        let count_b = 1_usize;
+        let bonus_b = (count_b as f64).ln().max(1.0);
+        let score_b = avg_b * bonus_b;
+
+        assert!(score_a > score_b,
+            "genus A (10 hits, 95% id, score={:.2}) should beat genus B (1 hit, 96% id, score={:.2})",
+            score_a, score_b);
     }
 }

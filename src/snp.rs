@@ -169,6 +169,13 @@ fn is_amino_acid(c: char) -> bool {
                 'M' | 'N' | 'P' | 'Q' | 'R' | 'S' | 'T' | 'V' | 'W' | 'Y')
 }
 
+/// Verify whether the expected SNP mutation is present in the contig sequence.
+///
+/// - `ref_start`: PAF target_start — 0-based start of alignment on reference gene
+/// - `ref_end`: PAF target_end — 0-based half-open end of alignment on reference gene
+/// - `contig_start`: 0-based start of alignment on the contig
+/// - `contig_end`: 0-based half-open end of alignment on the contig
+/// - `strand`: '+' or '-' indicating alignment orientation
 pub fn verify_snp(
     contig_seq: &str,
     gene_name: &str,
@@ -342,5 +349,39 @@ mod tests {
         assert_eq!(format!("{}", SnpStatus::WildType), "WildType");
         assert_eq!(format!("{}", SnpStatus::NovelVariant('L')), "Novel(L)");
         assert_eq!(format!("{}", SnpStatus::NotApplicable), "Acquired");
+    }
+
+    #[test]
+    fn test_snp_partial_alignment_offset() {
+        // Gene is 900nt long, but alignment starts at ref position 300.
+        // SNP at amino acid 83 → nucleotide range (246, 249) from gene start.
+        // Since ref_start=300, this SNP falls BEFORE the aligned region → NotCovered.
+        let contig = "A".repeat(2000);
+        let status = verify_snp(
+            &contig,
+            "gyrA_S83L|QUINOLONE",
+            300,   // ref_start
+            900,   // ref_end
+            100,   // contig_start
+            700,   // contig_end
+            '+',
+        );
+        assert_eq!(status, SnpStatus::NotCovered,
+            "SNP before ref_start should be NotCovered");
+    }
+
+    #[test]
+    fn test_snp_full_alignment_unchanged() {
+        // For full-coverage alignment (ref_start=0, ref_end=gene_len),
+        // behavior should be identical to before the fix.
+        let contig = "ATGTTTGGG";
+        let status = verify_snp(
+            contig,
+            "test_V2F",
+            0, 9,
+            0, 9,
+            '+',
+        );
+        assert_eq!(status, SnpStatus::Confirmed);
     }
 }

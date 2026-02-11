@@ -271,6 +271,8 @@ struct ArgHit {
     contig_start: usize,
     contig_end: usize,
     strand: char,
+    ref_start: usize,
+    ref_end: usize,
 }
 
 fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
@@ -805,7 +807,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
     if args.verbose {
         eprintln!("  [2/6] Running MEGAHIT assembly...");
     }
-    let megahit_dir = run_megahit(&filtered_r1, &filtered_r2, &sample_dir, &args.megahit, args.threads_per_sample)?;
+    let megahit_dir = run_megahit(&filtered_r1, &filtered_r2, &sample_dir, &args.megahit, args.threads_per_sample, args.min_contig_len)?;
     let contigs_file = megahit_dir.join("final.contigs.fa");
 
     if !contigs_file.exists() {
@@ -981,6 +983,8 @@ fn classify_genera(
                 arg_start: hit.contig_start,
                 arg_end: hit.contig_end,
                 strand: hit.strand,
+                ref_start: hit.ref_start,
+                ref_end: hit.ref_end,
             })
         })
         .collect();
@@ -1002,8 +1006,8 @@ fn classify_genera(
                 let snp_status = snp::verify_snp(
                     &pos.contig_seq,
                     &pos.arg_name,
-                    0,
-                    pos.arg_end - pos.arg_start,
+                    pos.ref_start,
+                    pos.ref_end,
                     pos.arg_start,
                     pos.arg_end,
                     pos.strand,
@@ -1118,6 +1122,8 @@ fn extend_contigs_strict(
         .collect())
 }
 
+// TODO: Performance optimization - reads are loaded twice (once in strict, once in flexible).
+// Consider caching the k-mer index from strict extension and reusing it here.
 fn extend_contigs_flexible(
     contigs: &[FastaRecord],
     r1: &Path,
@@ -1270,7 +1276,7 @@ fn normalize_read_name(name: &str) -> String {
     }
 }
 
-fn run_megahit(r1: &Path, r2: &Path, output_dir: &Path, megahit: &str, threads: usize) -> Result<PathBuf> {
+fn run_megahit(r1: &Path, r2: &Path, output_dir: &Path, megahit: &str, threads: usize, min_contig_len: usize) -> Result<PathBuf> {
     let megahit_dir = output_dir.join("megahit");
 
     if megahit_dir.exists() {
@@ -1282,16 +1288,17 @@ fn run_megahit(r1: &Path, r2: &Path, output_dir: &Path, megahit: &str, threads: 
         .arg("-2").arg(r2)
         .arg("-o").arg(&megahit_dir)
         .arg("-t").arg(threads.to_string())
-        .arg("--min-contig-len").arg("200")
+        .arg("--min-contig-len").arg(min_contig_len.to_string())
         .output()
         .context("Failed to run MEGAHIT")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        eprintln!("MEGAHIT failed (exit code: {:?})", output.status.code());
-        eprintln!("stderr: {}", stderr);
-        eprintln!("stdout: {}", stdout);
+        anyhow::bail!(
+            "MEGAHIT failed (exit code: {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        );
     }
 
     Ok(megahit_dir)
@@ -1349,6 +1356,8 @@ fn detect_args(paf_path: &Path, min_identity: f64, min_coverage: f64) -> Result<
                 contig_start: rec.query_start,
                 contig_end: rec.query_end,
                 strand: rec.strand,
+                ref_start: rec.target_start,
+                ref_end: rec.target_end,
             });
         }
     }
@@ -1360,7 +1369,7 @@ fn deduplicate_args(hits: Vec<ArgHit>) -> Vec<ArgHit> {
     let mut best: HashMap<String, ArgHit> = HashMap::new();
 
     for hit in hits {
-        let key = hit.arg_name.clone();
+        let key = format!("{}:{}", hit.arg_name, hit.contig);
         if let Some(existing) = best.get(&key) {
             if hit.identity > existing.identity {
                 best.insert(key, hit);
@@ -1373,4 +1382,78 @@ fn deduplicate_args(hits: Vec<ArgHit>) -> Vec<ArgHit> {
     let mut result: Vec<ArgHit> = best.into_values().collect();
     result.sort_by(|a, b| b.coverage.partial_cmp(&a.coverage).unwrap_or(std::cmp::Ordering::Equal));
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dedup_allows_same_gene_different_contigs() {
+        let hits = vec![
+            ArgHit {
+                arg_name: "blaTEM-1".into(),
+                arg_class: "BETA-LACTAM".into(),
+                contig: "contig_1".into(),
+                contig_len: 5000,
+                identity: 99.0,
+                coverage: 100.0,
+                contig_start: 100,
+                contig_end: 961,
+                strand: '+',
+                ref_start: 0,
+                ref_end: 861,
+            },
+            ArgHit {
+                arg_name: "blaTEM-1".into(),
+                arg_class: "BETA-LACTAM".into(),
+                contig: "contig_2".into(),
+                contig_len: 3000,
+                identity: 98.0,
+                coverage: 95.0,
+                contig_start: 200,
+                contig_end: 1061,
+                strand: '+',
+                ref_start: 0,
+                ref_end: 861,
+            },
+        ];
+        let deduped = deduplicate_args(hits);
+        assert_eq!(deduped.len(), 2, "same ARG on different contigs should both be kept");
+    }
+
+    #[test]
+    fn test_dedup_keeps_best_same_contig() {
+        let hits = vec![
+            ArgHit {
+                arg_name: "blaTEM-1".into(),
+                arg_class: "BETA-LACTAM".into(),
+                contig: "contig_1".into(),
+                contig_len: 5000,
+                identity: 99.0,
+                coverage: 100.0,
+                contig_start: 100,
+                contig_end: 961,
+                strand: '+',
+                ref_start: 0,
+                ref_end: 861,
+            },
+            ArgHit {
+                arg_name: "blaTEM-1".into(),
+                arg_class: "BETA-LACTAM".into(),
+                contig: "contig_1".into(),
+                contig_len: 5000,
+                identity: 97.0,
+                coverage: 90.0,
+                contig_start: 105,
+                contig_end: 960,
+                strand: '+',
+                ref_start: 5,
+                ref_end: 855,
+            },
+        ];
+        let deduped = deduplicate_args(hits);
+        assert_eq!(deduped.len(), 1, "overlapping hits on same contig should dedup to one");
+        assert_eq!(deduped[0].identity, 99.0, "best identity hit should be kept");
+    }
 }

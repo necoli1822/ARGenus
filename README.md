@@ -37,19 +37,18 @@ ARGenus requires the following tools in your PATH:
 - [minimap2](https://github.com/lh3/minimap2) - sequence alignment
 - [MEGAHIT](https://github.com/voutcn/megahit) - metagenomic assembly
 
+**Note**: ARGenus has been tested on Linux and macOS. Windows is not currently supported due to minimap2 and MEGAHIT dependencies.
+
 ## Database Setup
 
-ARGenus requires a flanking sequence database for genus classification. Download the pre-built database:
+ARGenus requires two databases: an ARG reference database and a flanking sequence database.
 
 ```bash
-# Download flanking database (approximately 60MB)
-argenus download-db --output databases/
-```
+# Step 1: Build ARG database
+argenus -b arg -o databases/
 
-Or build from source genomes (requires NCBI RefSeq data):
-
-```bash
-argenus build-db --genomes /path/to/refseq --output databases/flanking.fdb
+# Step 2: Build flanking database (requires NCBI GenBank data, several hours)
+argenus -b flank -a databases/AMR_NCBI.mmi -o databases/ -e your@email.com
 ```
 
 ## Usage
@@ -57,32 +56,35 @@ argenus build-db --genomes /path/to/refseq --output databases/flanking.fdb
 ### Basic usage
 
 ```bash
-argenus run \
-    --r1 sample_R1.fastq.gz \
-    --r2 sample_R2.fastq.gz \
-    --db databases/AMR_PanRes.mmi \
-    --fdb databases/flanking.fdb \
-    --output results/sample_argenus.tsv
+argenus \
+    -1 sample_R1.fastq.gz \
+    -2 sample_R2.fastq.gz \
+    -a databases/AMR_NCBI.mmi \
+    -f databases/flanking.fdb \
+    -o results/
 ```
 
 ### Options
 
 ```
-argenus run [OPTIONS]
+argenus [OPTIONS]
 
 Required:
-    --r1 <FILE>         Forward reads (FASTQ/FASTQ.gz)
-    --r2 <FILE>         Reverse reads (FASTQ/FASTQ.gz)
-    --db <FILE>         ARG database index (.mmi)
-    --fdb <FILE>        Flanking sequence database (.fdb)
-    --output <FILE>     Output TSV file
+    -1, --r1 <FILE>             Forward reads (FASTQ/FASTQ.gz)
+    -2, --r2 <FILE>             Reverse reads (FASTQ/FASTQ.gz)
+    -a, --arg-db <FILE>         ARG database (.mmi or .fasta)
+    -f, --flanking-db <FILE>    Flanking sequence database (.fdb)
+    -o, --outdir <DIR>          Output directory [default: .]
 
 Optional:
-    --threads <N>       Number of threads [default: 16]
-    --min-identity <F>  Minimum identity for ARG matching [default: 0.8]
-    --min-coverage <F>  Minimum coverage for ARG matching [default: 0.7]
-    --flank-identity <F> Minimum identity for genus classification [default: 0.9]
-    --include-wildtype  Include wild-type alleles in output
+    -l, --samples <PATH>        Batch mode: directory or sample ID list
+    -t, --threads <N>           Total threads [default: auto]
+    -s, --threads-per-sample <N> Threads per sample [default: 8]
+    -i, --arg-identity <F>      Minimum ARG identity [default: 0.80]
+    -c, --arg-coverage <F>      Minimum ARG coverage [default: 0.70]
+    -g, --min-contig-len <BP>   Minimum contig length [default: 200]
+    -u, --keep-temp             Keep intermediate files
+    --all-hits                  Include WildType/NotCovered in output
 ```
 
 ## Output Format
@@ -91,16 +93,20 @@ ARGenus produces a tab-delimited file with the following columns:
 
 | Column | Description |
 |--------|-------------|
-| sample | Sample identifier |
-| gene | ARG gene name |
-| drug_class | Antimicrobial drug class |
-| genus | Assigned source genus |
-| confidence | Classification confidence (mean identity) |
-| specificity | Gene-genus association strength |
-| identity | ARG sequence identity |
-| coverage | ARG sequence coverage |
-| contig_length | Length of assembled contig |
-| snp_status | SNP verification result |
+| Sample | Sample identifier |
+| ARG_Name | ARG gene name |
+| ARG_Class | Antimicrobial drug class |
+| Genus | Assigned source genus |
+| Confidence | Classification confidence score |
+| Specificity | Database prevalence of gene in assigned genus (%) |
+| ARG_Identity | ARG sequence identity (%) |
+| ARG_Coverage | ARG sequence coverage (%) |
+| Contig_Len | Length of assembled contig |
+| Upstream_Len | Upstream flanking sequence length |
+| Downstream_Len | Downstream flanking sequence length |
+| Extension_Method | Contig extension method (strict/flexible) |
+| SNP_Status | SNP verification result |
+| Top_Matches | Top 5 genus matches with scores |
 
 ## Workflow
 
