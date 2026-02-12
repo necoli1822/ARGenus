@@ -1,5 +1,5 @@
 [package]
-name = "argenus"
+name = "ARGenus"
 version = "0.2.0"
 edition = "2021"
 description = "ARG detection and genus-level classification using flanking sequence analysis"
@@ -7,7 +7,7 @@ authors = ["Your Name <your.email@institution.edu>"]
 license = "MIT"
 repository = "https://github.com/necoli1822/ARGenus"
 homepage = "https://github.com/necoli1822/ARGenus"
-documentation = "https://docs.rs/argenus"
+documentation = "https://docs.rs/ARGenus"
 readme = "README.md"
 keywords = ["bioinformatics", "ARG", "metagenomics", "genomics", "amr"]
 categories = ["science", "command-line-utilities"]
@@ -21,11 +21,11 @@ exclude = [
 ]
 
 [lib]
-name = "argenus"
+name = "ARGenus"
 path = "src/lib.rs"
 
 [[bin]]
-name = "argenus"
+name = "ARGenus"
 path = "src/main.rs"
 
 [[bin]]
