@@ -9,7 +9,7 @@ repository = "https://github.com/necoli1822/ARGenus"
 homepage = "https://github.com/necoli1822/ARGenus"
 documentation = "https://docs.rs/argenus"
 readme = "README.md"
-keywords = ["bioinformatics", "antibiotic-resistance", "metagenomics", "genomics", "amr"]
+keywords = ["bioinformatics", "ARG", "metagenomics", "genomics", "amr"]
 categories = ["science", "command-line-utilities"]
 exclude = [
     "databases/*",
