@@ -1,15 +1,15 @@
 [package]
-name = "ARGenus"
-version = "0.1.0"
+name = "argenus"
+version = "0.2.0"
 edition = "2021"
 description = "ARG detection and genus-level classification using flanking sequence analysis"
-authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]
+authors = ["Your Name <your.email@institution.edu>"]
 license = "MIT"
 repository = "https://github.com/necoli1822/ARGenus"
 homepage = "https://github.com/necoli1822/ARGenus"
 documentation = "https://docs.rs/argenus"
 readme = "README.md"
-keywords = ["bioinformatics", "antibiotics", "metagenomics", "genomics", "AMR"]
+keywords = ["bioinformatics", "antibiotic-resistance", "metagenomics", "genomics", "amr"]
 categories = ["science", "command-line-utilities"]
 exclude = [
     "databases/*",
