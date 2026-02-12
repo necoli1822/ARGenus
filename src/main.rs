@@ -6,6 +6,7 @@ mod snp;
 mod flanking_db;
 mod arg_db;
 mod fdb;
+mod flanking_db_ntprok;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -24,6 +25,7 @@ use paf::PafReader;
 use extender::{ContigExtender, ExtenderConfig, write_extended_contigs};
 use classifier::{ArgPosition, GenusResult, GenusClassifier};
 
+/// Parse and validate ARG identity threshold (must be >= 0.8)
 fn parse_arg_identity(s: &str) -> Result<f64, String> {
     let val: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
     if !(0.8..=1.0).contains(&val) {
@@ -33,6 +35,7 @@ fn parse_arg_identity(s: &str) -> Result<f64, String> {
     }
 }
 
+/// Parse and validate ARG coverage threshold (must be >= 0.7)
 fn parse_arg_coverage(s: &str) -> Result<f64, String> {
     let val: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
     if !(0.7..=1.0).contains(&val) {
@@ -91,110 +94,185 @@ EXAMPLES:
 For more information, visit: https://github.com/your-repo/argenus
 "#)]
 struct Args {
-
+    // ===== INPUT OPTIONS =====
+    /// Forward reads (FASTQ/FASTQ.GZ), comma-separated for multiple samples
     #[arg(short = '1', long, value_name = "FILE(S)", help_heading = "Input")]
     r1: Option<String>,
 
+    /// Reverse reads (FASTQ/FASTQ.GZ), comma-separated for multiple samples
     #[arg(short = '2', long, value_name = "FILE(S)", help_heading = "Input")]
     r2: Option<String>,
 
+    /// Sample list: file (IDs, one per line) or directory (auto-detect FASTQs)
     #[arg(short = 'l', long, value_name = "PATH", help_heading = "Input")]
     samples: Option<PathBuf>,
 
+    // ===== DATABASE OPTIONS =====
+    /// Build database: 'arg' (AMR sequences from NCBI/CARD) or 'flank' (flanking DB)
     #[arg(short = 'b', long = "build-db", value_name = "TYPE", help_heading = "Database")]
     build_db: Option<String>,
 
+    /// Data source for ARG database: 'ncbi', 'card', 'panres', or 'unified' (default: ncbi).
+    /// - ncbi: NCBI AMRFinderPlus (~8,000 genes, curated)
+    /// - card: CARD database (~6,000 genes, NCBI-mapped + CARD-only marked with '^')
+    /// - panres: PanRes combined database (~14,000 genes from ARGprofiler)
+    /// - unified: Use a pre-built unified ARG database (requires --unified-db)
     #[arg(short = 'x', long, value_name = "SOURCE", default_value = "ncbi", help_heading = "Database")]
     source: String,
 
+    /// Path to pre-built unified ARG database FASTA (required when --source unified).
+    /// The FASTA should have headers in format: >ARO_ID|gene_name|source|length
     #[arg(long = "unified-db", value_name = "FILE", help_heading = "Database")]
     unified_db: Option<PathBuf>,
 
+    /// ARG reference database (.mmi from 'argenus -b arg', or custom .fas)
     #[arg(short = 'a', long = "arg-db", value_name = "FILE", help_heading = "Database")]
     arg_db: Option<PathBuf>,
 
+    /// Flanking sequence database (.fdb format) for genus classification
     #[arg(short = 'f', long = "flanking-db", value_name = "FILE", help_heading = "Database")]
     flanking_db: Option<PathBuf>,
 
+    /// NCBI email for API access (required for --build-db flank)
+    /// Provides higher rate limits (10 req/s vs 5 req/s)
     #[arg(short = 'e', long, value_name = "EMAIL", help_heading = "Database")]
     email: Option<String>,
 
-    #[arg(short = 'p', long = "flanking-length", value_name = "BP", default_value = "1050", help_heading = "Database")]
+    /// Flanking region length in bp (default: 1000)
+    /// Used for --build-db flank to extract upstream/downstream sequences
+    #[arg(short = 'p', long = "flanking-length", value_name = "BP", default_value = "1000", help_heading = "Database")]
     flanking_length: usize,
 
+    /// Download queue buffer size in GB for --build-db flank (default: 30)
+    /// Controls backpressure when alignment is slower than download
     #[arg(short = 'q', long = "queue-buffer", value_name = "GB", default_value = "30", help_heading = "Database")]
     queue_buffer_gb: u32,
 
+    /// Pre-downloaded PLSDB directory (contains meta.tar.gz and sequences.fasta)
+    /// Use this if PLSDB server is slow or unreliable
     #[arg(short = 'd', long = "plsdb-dir", value_name = "DIR", help_heading = "Database")]
     plsdb_dir: Option<PathBuf>,
 
+    /// Skip PLSDB plasmid sequences (use only NCBI genomes)
     #[arg(short = 'z', long = "skip-plsdb", help_heading = "Database")]
     skip_plsdb: bool,
 
+    /// Flanking database build mode: 'short' (1000bp, GenBank/PLSDB) or 'long' (5000bp, nt_prok)
+    #[arg(long = "mode", value_name = "MODE", default_value = "short", help_heading = "Database")]
+    fdb_mode: String,
+
+    /// Path to blastn executable (required for --mode long)
+    #[arg(long = "blastn-path", value_name = "PATH", help_heading = "Database")]
+    blastn_path: Option<PathBuf>,
+
+    /// Path to blastdbcmd executable (required for --mode long)
+    #[arg(long = "blastdbcmd-path", value_name = "PATH", help_heading = "Database")]
+    blastdbcmd_path: Option<PathBuf>,
+
+    /// Path to nt_prok BLAST database (required for --mode long)
+    #[arg(long = "nt-prok-db", value_name = "PATH", help_heading = "Database")]
+    nt_prok_db: Option<PathBuf>,
+
+    /// Path to NCBI taxdump directory (optional, auto-downloads to output/taxonomy if not specified)
+    #[arg(long = "taxdump-dir", value_name = "PATH", help_heading = "Database")]
+    taxdump_dir: Option<PathBuf>,
+
+    /// For -b fdb: input TSV is already sorted by gene name (streaming mode, memory-efficient)
+    #[arg(long = "sorted", help_heading = "Database")]
+    sorted: bool,
+
+    // ===== OUTPUT OPTIONS =====
+    /// Output directory (created if not exists)
     #[arg(short = 'o', long, value_name = "DIR", default_value = ".", help_heading = "Output")]
     outdir: PathBuf,
 
+    /// Keep intermediate files (filtered reads, contigs, PAF files)
     #[arg(short = 'u', long, help_heading = "Output")]
     keep_temp: bool,
 
+    /// Verbose output to stderr (progress and statistics)
     #[arg(short = 'v', long, help_heading = "Output")]
     verbose: bool,
 
+    /// Include all hits (WildType and NotCovered) in output
+    /// By default, only true resistance genes are reported (Acquired, Confirmed, Novel)
     #[arg(long = "all-hits", help_heading = "Output")]
     all_hits: bool,
 
+    // ===== ARG DETECTION =====
+    /// Minimum identity for ARG detection [0.8-1.0]
     #[arg(short = 'i', long = "arg-identity", value_name = "FLOAT",
           default_value = "0.80", value_parser = parse_arg_identity, help_heading = "ARG Detection")]
     arg_identity: f64,
 
+    /// Minimum query coverage for ARG detection [0.7-1.0]
     #[arg(short = 'c', long = "arg-coverage", value_name = "FLOAT",
           default_value = "0.70", value_parser = parse_arg_coverage, help_heading = "ARG Detection")]
     arg_coverage: f64,
 
+    // ===== GENUS CLASSIFICATION =====
+    /// Minimum specificity for genus assignment [0-100%]
     #[arg(short = 'r', long, value_name = "PERCENT", default_value = "95", help_heading = "Genus Classification")]
     resolution: f64,
 
-    #[arg(short = 'n', long, value_name = "BP", default_value = "1050", help_heading = "Genus Classification")]
+    /// Maximum flanking sequence length to extract (bp)
+    #[arg(short = 'n', long, value_name = "BP", default_value = "1000", help_heading = "Genus Classification")]
     max_flanking: usize,
 
+    // ===== ASSEMBLY & EXTENSION =====
+    /// Minimum contig length to keep (bp)
     #[arg(short = 'g', long, value_name = "BP", default_value = "200", help_heading = "Assembly")]
     min_contig_len: usize,
 
+    /// K-mer size for contig extension [31-127, odd]
     #[arg(short = 'k', long, value_name = "SIZE", default_value = "62", help_heading = "Assembly")]
     ext_kmer_size: usize,
 
+    /// Extension step length (bp)
     #[arg(short = 'j', long, value_name = "BP", default_value = "100", help_heading = "Assembly")]
     ext_length: usize,
 
+    // ===== READ FILTERING =====
+    /// Minimum alignment identity for read filtering [0.0-1.0]
     #[arg(short = 'm', long, value_name = "FLOAT", default_value = "0.80", help_heading = "Read Filtering")]
     identity: f64,
 
+    /// Minimum alignment length for read filtering (bp)
     #[arg(short = 'w', long, value_name = "BP", default_value = "50", help_heading = "Read Filtering")]
     min_align_len: usize,
 
+    // ===== RUNTIME =====
+    /// Number of threads [0 = auto-detect]
     #[arg(short = 't', long, value_name = "NUM", default_value = "0", help_heading = "Runtime")]
     threads: usize,
 
+    /// Threads per sample for parallel processing (default: 8)
     #[arg(short = 's', long, value_name = "NUM", default_value = "8", help_heading = "Runtime")]
     threads_per_sample: usize,
 
+    /// Skip confirmation prompts (auto-yes)
     #[arg(short = 'y', long, help_heading = "Runtime")]
     yes: bool,
 
+    // Internal fields (not CLI options)
+    /// Path to minimap2 (auto-detected)
     #[arg(skip)]
     minimap2: String,
 
+    /// Path to megahit (auto-detected)
     #[arg(skip)]
     megahit: String,
 }
 
+/// Find executable in system PATH
 fn find_executable(name: &str) -> Result<PathBuf> {
-
+    // First check if it's an absolute path or in current directory
     let path = Path::new(name);
     if path.is_absolute() && path.exists() {
         return Ok(path.to_path_buf());
     }
 
+    // Search in PATH
     if let Ok(paths) = env::var("PATH") {
         for dir in env::split_paths(&paths) {
             let full_path = dir.join(name);
@@ -207,6 +285,7 @@ fn find_executable(name: &str) -> Result<PathBuf> {
     anyhow::bail!("{} not found in PATH. Please install it or add it to your PATH.", name)
 }
 
+/// Simple counting semaphore for limiting concurrent operations
 struct Semaphore {
     count: Mutex<usize>,
     cvar: Condvar,
@@ -235,6 +314,7 @@ impl Semaphore {
     }
 }
 
+/// Sample information
 #[derive(Debug, Clone)]
 struct Sample {
     name: String,
@@ -242,24 +322,26 @@ struct Sample {
     r2: PathBuf,
 }
 
+/// Final result row for output
 #[derive(Debug, Clone)]
 struct ResultRow {
     sample: String,
     arg_name: String,
     arg_class: String,
     genus: String,
-    confidence: f64,
-    specificity: f64,
+    confidence: f64,    // Jaccard similarity × 100 (0-100)
+    specificity: f64,   // Gene specificity × 100 (0-100)
     identity: f64,
     coverage: f64,
     contig_len: usize,
     upstream_len: usize,
     downstream_len: usize,
-    extension_method: String,
+    extension_method: String,  // "strict" (tadpole) or "flexible" (rust extender)
     top_matches: String,
-    snp_status: String,
+    snp_status: String,  // SNP verification status for point mutation ARGs
 }
 
+/// Detected ARG information with position
 #[derive(Debug, Clone)]
 struct ArgHit {
     arg_name: String,
@@ -273,11 +355,14 @@ struct ArgHit {
     strand: char,
 }
 
+/// Validate ARG database file format
+/// Returns (is_fasta, is_mmi) tuple
 fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
     use std::io::{BufRead, BufReader, Read};
 
     let mut file = std::fs::File::open(path)?;
 
+    // Read first 16 bytes for binary detection
     let mut header = [0u8; 16];
     let bytes_read = file.read(&mut header)?;
 
@@ -289,14 +374,17 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
         );
     }
 
+    // MMI files contain null bytes in header (binary format)
     if header[..bytes_read].contains(&0u8) {
         return Ok((false, true));
     }
 
+    // Validate as FASTA: reopen and parse
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
+    // Find first non-empty line (should be header starting with '>')
     let header_line = loop {
         match lines.next() {
             Some(Ok(line)) if !line.trim().is_empty() => break line,
@@ -316,6 +404,7 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
         );
     }
 
+    // Read sequence line(s)
     let seq_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => anyhow::bail!("Failed to read sequence: {}", e),
@@ -326,6 +415,7 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
         anyhow::bail!("Invalid FASTA: empty sequence in {}", path.display());
     }
 
+    // Validate nucleotide characters (ACGTN + IUPAC ambiguity codes)
     const VALID_NUCLEOTIDES: &[u8] = b"ACGTNacgtnRYSWKMBDHVryswkmbdhv";
     let invalid_count = seq_line.bytes()
         .filter(|b| !VALID_NUCLEOTIDES.contains(b))
@@ -343,7 +433,23 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
     Ok((true, false))
 }
 
-fn handle_build_db(db_type: &str, source: &str, output_dir: &Path, threads: usize, email: Option<&str>, arg_db: Option<&Path>, unified_db: Option<&Path>, config: crate::flanking_db::FlankBuildConfig) -> Result<()> {
+/// Handle --build-db command
+fn handle_build_db(
+    db_type: &str,
+    source: &str,
+    output_dir: &Path,
+    threads: usize,
+    email: Option<&str>,
+    arg_db: Option<&Path>,
+    unified_db: Option<&Path>,
+    config: crate::flanking_db::FlankBuildConfig,
+    fdb_mode: &str,
+    sorted: bool,
+    blastn_path: Option<&Path>,
+    blastdbcmd_path: Option<&Path>,
+    nt_prok_db: Option<&Path>,
+    taxdump_dir: Option<&Path>,
+) -> Result<()> {
     match db_type {
         "arg" => {
             let source_desc = match source {
@@ -356,6 +462,7 @@ fn handle_build_db(db_type: &str, source: &str, output_dir: &Path, threads: usiz
                 }
             };
 
+            // For unified source, require --unified-db
             if source == "unified" {
                 let unified_path = unified_db.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -378,6 +485,7 @@ fn handle_build_db(db_type: &str, source: &str, output_dir: &Path, threads: usiz
                 return arg_db::build_from_unified(output_dir, unified_path, threads);
             }
 
+            // Validate: -a should not be used with -b arg
             if arg_db.is_some() {
                 anyhow::bail!(
                     "--arg-db (-a) is not used for ARG database build.\n\
@@ -399,7 +507,7 @@ fn handle_build_db(db_type: &str, source: &str, output_dir: &Path, threads: usiz
             arg_db::build(output_dir, source, threads)
         }
         "flank" => {
-
+            // Validate arg_db for flank build
             let arg_db = match arg_db {
                 Some(p) => p,
                 None => {
@@ -413,6 +521,7 @@ fn handle_build_db(db_type: &str, source: &str, output_dir: &Path, threads: usiz
                 }
             };
 
+            // Validate that arg_db exists
             if !arg_db.exists() {
                 anyhow::bail!(
                     "AMR database not found: {}\n\
@@ -421,6 +530,7 @@ fn handle_build_db(db_type: &str, source: &str, output_dir: &Path, threads: usiz
                 );
             }
 
+            // Validate file content using proper parsers
             let (is_fasta, is_mmi) = validate_arg_db_file(arg_db)?;
 
             if !is_fasta && !is_mmi {
@@ -432,94 +542,206 @@ fn handle_build_db(db_type: &str, source: &str, output_dir: &Path, threads: usiz
                 );
             }
 
-            let arg_db = if is_mmi {
-
-                arg_db.to_path_buf()
-            } else {
-
-                let mmi_path = arg_db.with_extension("mmi");
-                if mmi_path.exists() {
-                    eprintln!("Using existing minimap2 index: {}", mmi_path.display());
-                    mmi_path
-                } else {
-                    eprintln!("Building minimap2 index for faster alignment...");
-                    let output = std::process::Command::new("minimap2")
-                        .args(["-d", mmi_path.to_str().unwrap(), arg_db.to_str().unwrap()])
-                        .output();
-
-                    match output {
-                        Ok(o) if o.status.success() => {
-                            eprintln!("Created: {}", mmi_path.display());
+            // Route based on mode
+            match fdb_mode {
+                "short" => {
+                    // Ensure we have a .mmi index for efficient repeated minimap2 calls
+                    let arg_db = if is_mmi {
+                        // Already a minimap2 index, use directly
+                        arg_db.to_path_buf()
+                    } else {
+                        // FASTA file - check for existing .mmi or build one
+                        let mmi_path = arg_db.with_extension("mmi");
+                        if mmi_path.exists() {
+                            eprintln!("Using existing minimap2 index: {}", mmi_path.display());
                             mmi_path
+                        } else {
+                            eprintln!("Building minimap2 index for faster alignment...");
+                            let output = std::process::Command::new("minimap2")
+                                .args(["-d", mmi_path.to_str().unwrap(), arg_db.to_str().unwrap()])
+                                .output();
+
+                            match output {
+                                Ok(o) if o.status.success() => {
+                                    eprintln!("Created: {}", mmi_path.display());
+                                    mmi_path
+                                }
+                                Ok(o) => {
+                                    eprintln!("Warning: minimap2 indexing failed, using FASTA directly");
+                                    eprintln!("{}", String::from_utf8_lossy(&o.stderr));
+                                    arg_db.to_path_buf()
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: minimap2 not found ({}), using FASTA directly", e);
+                                    arg_db.to_path_buf()
+                                }
+                            }
                         }
-                        Ok(o) => {
-                            eprintln!("Warning: minimap2 indexing failed, using FASTA directly");
-                            eprintln!("{}", String::from_utf8_lossy(&o.stderr));
-                            arg_db.to_path_buf()
+                    };
+
+                    // Validate email for short mode
+                    let email = match email {
+                        Some(e) => e,
+                        None => {
+                            anyhow::bail!(
+                                "--email is required for --mode short (GenBank/PLSDB download).\n\
+                                 Example: argenus -b flank --mode short -a ./db/AMR_NCBI.mmi -o ./db -e your@email.com\n\n\
+                                 NCBI requires email for API access. Register at:\n\
+                                 https://www.ncbi.nlm.nih.gov/account/"
+                            );
                         }
-                        Err(e) => {
-                            eprintln!("Warning: minimap2 not found ({}), using FASTA directly", e);
-                            arg_db.to_path_buf()
-                        }
+                    };
+
+                    eprintln!("============================================================");
+                    eprintln!(" ARGenus Database Builder - Flanking Sequence Database");
+                    eprintln!("============================================================");
+                    eprintln!();
+                    eprintln!("Mode: short (1000bp, GenBank/PLSDB)");
+                    eprintln!();
+                    eprintln!("This will build the flanking sequence database from genomic");
+                    eprintln!("data. This is a resource-intensive process that requires:");
+                    eprintln!("  - ~120GB of prokaryotic genome data (NCBI genomes)");
+                    eprintln!("  - ~7GB PLSDB plasmid sequences (auto-downloaded)");
+                    eprintln!("  - Several hours of processing time");
+                    eprintln!("  - ~40GB of disk space for intermediate files");
+                    eprintln!();
+                    eprintln!("Pipeline:");
+                    eprintln!("  1. Download NCBI taxonomy database");
+                    eprintln!("  2. Download prokaryotic genomes (bacteria + archaea)");
+                    eprintln!("  3. Download PLSDB plasmid sequences");
+                    eprintln!("  4. Align AMR genes to genomes (minimap2)");
+                    eprintln!("  5. Extract flanking sequences → TSV (~27 GB)");
+                    eprintln!("  6. Build FDB (external sort + zstd) → ~350 MB");
+                    eprintln!();
+                    eprintln!("AMR Database: {}", arg_db.display());
+                    eprintln!("NCBI Email: {}", email);
+                    eprintln!("Threads: {}", threads);
+                    eprintln!("Flanking length: {} bp", config.flanking_length);
+                    eprintln!("Queue buffer: {} GB", config.queue_buffer_gb);
+                    if let Some(ref dir) = config.plsdb.dir {
+                        eprintln!("PLSDB: {} (pre-downloaded)", dir.display());
+                    } else if config.plsdb.skip {
+                        eprintln!("PLSDB: skipped");
+                    } else {
+                        eprintln!("PLSDB: auto-download from server");
                     }
-                }
-            };
+                    eprintln!();
+                    eprintln!("Note: This process takes several hours. Progress will be displayed.");
+                    eprintln!();
 
-            let email = match email {
-                Some(e) => e,
-                None => {
+                    // Existing GenBank/PLSDB workflow (1000bp)
+                    arg_db::build_flanking_db(output_dir, &arg_db, threads, email, config)
+                }
+                "long" => {
+                    // New nt_prok workflow (5000bp)
+                    // Validate required paths
+                    let blastn = blastn_path.ok_or_else(|| {
+                        anyhow::anyhow!("--blastn-path is required for --mode long")
+                    })?;
+                    let blastdbcmd = blastdbcmd_path.ok_or_else(|| {
+                        anyhow::anyhow!("--blastdbcmd-path is required for --mode long")
+                    })?;
+                    let nt_prok = nt_prok_db.ok_or_else(|| {
+                        anyhow::anyhow!("--nt-prok-db is required for --mode long")
+                    })?;
+                    // Use user-specified taxdump or default to output_dir/taxonomy (auto-download)
+                    let taxdump = taxdump_dir
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| output_dir.join("taxonomy"));
+
+                    // Validate paths exist
+                    if !blastn.exists() {
+                        anyhow::bail!("blastn not found: {}", blastn.display());
+                    }
+                    if !blastdbcmd.exists() {
+                        anyhow::bail!("blastdbcmd not found: {}", blastdbcmd.display());
+                    }
+
+                    // For --mode long, require FASTA (not .mmi)
+                    // The .mmi format is a lossy index that cannot recover sequences
+                    flanking_db_ntprok::validate_arg_db_format(&arg_db)?;
+
+                    let ntprok_config = flanking_db_ntprok::NtProkConfig {
+                        blastn_path: blastn.to_path_buf(),
+                        blastdbcmd_path: blastdbcmd.to_path_buf(),
+                        nt_prok_db: nt_prok.to_path_buf(),
+                        taxdump_dir: taxdump.clone(),
+                        flanking_length: 5000,
+                        threads,
+                        blast_identity: 95.0,
+                        blast_qcov: 90.0,
+                    };
+
+                    eprintln!("============================================================");
+                    eprintln!(" ARGenus Database Builder - Long Flanking (5000bp, nt_prok)");
+                    eprintln!("============================================================");
+                    eprintln!();
+                    eprintln!("Mode: long (5000bp flanking via BLASTN against nt_prok)");
+                    eprintln!("ARG Database: {}", arg_db.display());
+                    eprintln!("BLASTN: {}", blastn.display());
+                    eprintln!("blastdbcmd: {}", blastdbcmd.display());
+                    eprintln!("nt_prok DB: {}", nt_prok.display());
+                    eprintln!("taxdump: {}", taxdump.display());
+                    eprintln!("Threads: {}", threads);
+                    eprintln!();
+
+                    flanking_db_ntprok::build(output_dir, &arg_db, ntprok_config)
+                }
+                other => {
                     anyhow::bail!(
-                        "--email is required for flanking database build.\n\
-                         Example: argenus -b flank -a ./db/AMR_NCBI.mmi -o ./db -e your@email.com\n\n\
-                         NCBI requires email for API access. Register at:\n\
-                         https://www.ncbi.nlm.nih.gov/account/"
-                    );
+                        "Invalid --mode '{}'. Use 'short' (1000bp, GenBank/PLSDB) or 'long' (5000bp, nt_prok).",
+                        other
+                    )
                 }
-            };
-
-            eprintln!("============================================================");
-            eprintln!(" ARGenus Database Builder - Flanking Sequence Database");
-            eprintln!("============================================================");
-            eprintln!();
-            eprintln!("This will build the flanking sequence database from genomic");
-            eprintln!("data. This is a resource-intensive process that requires:");
-            eprintln!("  - ~120GB of prokaryotic genome data (NCBI genomes)");
-            eprintln!("  - ~7GB PLSDB plasmid sequences (auto-downloaded)");
-            eprintln!("  - Several hours of processing time");
-            eprintln!("  - ~40GB of disk space for intermediate files");
-            eprintln!();
-            eprintln!("Pipeline:");
-            eprintln!("  1. Download NCBI taxonomy database");
-            eprintln!("  2. Download prokaryotic genomes (bacteria + archaea)");
-            eprintln!("  3. Download PLSDB plasmid sequences");
-            eprintln!("  4. Align AMR genes to genomes (minimap2)");
-            eprintln!("  5. Extract flanking sequences → TSV (~27 GB)");
-            eprintln!("  6. Build FDB (external sort + zstd) → ~350 MB");
-            eprintln!();
-            eprintln!("AMR Database: {}", arg_db.display());
-            eprintln!("NCBI Email: {}", email);
-            eprintln!("Threads: {}", threads);
-            eprintln!("Flanking length: {} bp", config.flanking_length);
-            eprintln!("Queue buffer: {} GB", config.queue_buffer_gb);
-            if let Some(ref dir) = config.plsdb.dir {
-                eprintln!("PLSDB: {} (pre-downloaded)", dir.display());
-            } else if config.plsdb.skip {
-                eprintln!("PLSDB: skipped");
-            } else {
-                eprintln!("PLSDB: auto-download from server");
             }
-            eprintln!();
-            eprintln!("Note: This process takes several hours. Progress will be displayed.");
-            eprintln!();
+        }
+        "fdb" => {
+            // Build FDB directly from TSV
+            let tsv_path = arg_db.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--arg-db is required for -b fdb (path to input TSV file).\n\
+                     Example: argenus -b fdb -a flanking.tsv -o ./output/\n\
+                     Use --sorted flag if TSV is pre-sorted by gene name (memory-efficient)"
+                )
+            })?;
 
-            arg_db::build_flanking_db(output_dir, &arg_db, threads, email, config)
+            if !tsv_path.exists() {
+                anyhow::bail!("TSV file not found: {}", tsv_path.display());
+            }
+
+            let fdb_path = output_dir.join("flanking.fdb");
+            std::fs::create_dir_all(output_dir)?;
+
+            eprintln!("============================================================");
+            eprintln!(" ARGenus FDB Builder - Compress TSV to FDB");
+            eprintln!("============================================================");
+            eprintln!();
+            eprintln!("Input TSV: {}", tsv_path.display());
+            eprintln!("Output FDB: {}", fdb_path.display());
+
+            if sorted {
+                eprintln!("Mode: Streaming (pre-sorted input, memory-efficient)");
+                eprintln!();
+                crate::fdb::build_from_sorted(tsv_path, &fdb_path)?;
+            } else {
+                eprintln!("Mode: External sort (unsorted input)");
+                eprintln!("Threads: {}", threads);
+                eprintln!("Buffer: {} MB", config.queue_buffer_gb * 1024);
+                eprintln!();
+                crate::fdb::build(tsv_path, &fdb_path, (config.queue_buffer_gb * 1024) as usize, threads)?;
+            }
+
+            eprintln!();
+            eprintln!("FDB build complete: {}", fdb_path.display());
+            Ok(())
         }
         _ => {
             anyhow::bail!(
-                "Unknown database type '{}'. Use 'arg' or 'flank'.\n\
+                "Unknown database type '{}'. Use 'arg', 'flank', or 'fdb'.\n\
                  Examples:\n  \
                    argenus -b arg -o ./db    # Build AMR reference database\n  \
-                   argenus -b flank -o ./db  # Build flanking sequence database",
+                   argenus -b flank -o ./db  # Build flanking sequence database\n  \
+                   argenus -b fdb -a in.tsv -o ./db  # Build FDB from TSV",
                 db_type
             );
         }
@@ -530,10 +752,12 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     let start_time = Instant::now();
 
+    // Auto-detect threads first (needed for build-db too)
     if args.threads == 0 {
         args.threads = num_cpus::get();
     }
 
+    // Handle --build-db mode
     if let Some(db_type) = &args.build_db {
         let config = crate::flanking_db::FlankBuildConfig {
             flanking_length: args.flanking_length,
@@ -543,9 +767,25 @@ fn main() -> Result<()> {
                 skip: args.skip_plsdb,
             },
         };
-        return handle_build_db(db_type, &args.source, &args.outdir, args.threads, args.email.as_deref(), args.arg_db.as_deref(), args.unified_db.as_deref(), config);
+        return handle_build_db(
+            db_type,
+            &args.source,
+            &args.outdir,
+            args.threads,
+            args.email.as_deref(),
+            args.arg_db.as_deref(),
+            args.unified_db.as_deref(),
+            config,
+            &args.fdb_mode,
+            args.sorted,
+            args.blastn_path.as_deref(),
+            args.blastdbcmd_path.as_deref(),
+            args.nt_prok_db.as_deref(),
+            args.taxdump_dir.as_deref(),
+        );
     }
 
+    // Validate required arguments for analysis mode
     if args.arg_db.is_none() {
         anyhow::bail!("--arg-db is required for analysis mode");
     }
@@ -553,6 +793,7 @@ fn main() -> Result<()> {
         anyhow::bail!("--flanking-db is required for analysis mode");
     }
 
+    // Auto-detect external tools
     args.minimap2 = find_executable("minimap2")?.to_string_lossy().to_string();
     args.megahit = find_executable("megahit")?.to_string_lossy().to_string();
 
@@ -561,16 +802,19 @@ fn main() -> Result<()> {
         eprintln!("Found megahit: {}", args.megahit);
     }
 
+    // Configure rayon
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build_global()
         .ok();
 
+    // Parse samples
     let samples = parse_samples(&args)?;
     if samples.is_empty() {
         anyhow::bail!("No samples provided. Use -1/-2 or --samples");
     }
 
+    // Calculate concurrent sample count
     let max_concurrent = (args.threads / args.threads_per_sample).max(1);
 
     if args.verbose {
@@ -578,8 +822,10 @@ fn main() -> Result<()> {
                   samples.len(), args.threads, max_concurrent, args.threads_per_sample);
     }
 
+    // Create output directory
     fs::create_dir_all(&args.outdir)?;
 
+    // Process samples in parallel with semaphore-based concurrency control
     let all_results: Arc<Mutex<Vec<ResultRow>>> = Arc::new(Mutex::new(Vec::new()));
     let semaphore = Semaphore::new(max_concurrent);
     let sample_counter = Mutex::new(0usize);
@@ -618,14 +864,16 @@ fn main() -> Result<()> {
         }
     });
 
+    // Output results
     let final_results = Arc::try_unwrap(all_results)
         .expect("All threads should have finished")
         .into_inner()
         .unwrap();
     output_results(&final_results, &args)?;
 
+    // Cleanup temp files (keep results)
     if !args.keep_temp {
-
+        // Remove sample subdirectories but keep results file
         for sample in &samples {
             let sample_dir = args.outdir.join(&sample.name);
             let _ = fs::remove_dir_all(&sample_dir);
@@ -639,11 +887,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Auto-detect FASTQ pairs in a directory
 fn find_samples_in_dir(dir: &Path) -> Result<Vec<Sample>> {
     use std::collections::BTreeSet;
 
     let mut sample_ids: BTreeSet<String> = BTreeSet::new();
 
+    // R1 patterns to detect sample IDs
     let r1_suffixes = ["_R1.fastq.gz", "_R1.fq.gz", "_1.fastq.gz", "_1.fq.gz",
                        "_R1.fastq", "_R1.fq", "_1.fastq", "_1.fq"];
 
@@ -658,6 +908,7 @@ fn find_samples_in_dir(dir: &Path) -> Result<Vec<Sample>> {
             .and_then(|n| n.to_str())
             .unwrap_or("");
 
+        // Check if this is an R1 file and extract sample ID
         for suffix in &r1_suffixes {
             if filename.ends_with(suffix) {
                 let id = filename.strip_suffix(suffix).unwrap();
@@ -667,6 +918,7 @@ fn find_samples_in_dir(dir: &Path) -> Result<Vec<Sample>> {
         }
     }
 
+    // Build sample list
     let mut samples = Vec::new();
     for id in sample_ids {
         let (r1, r2) = find_fastq_pair(dir, &id)?;
@@ -684,8 +936,9 @@ fn find_samples_in_dir(dir: &Path) -> Result<Vec<Sample>> {
     Ok(samples)
 }
 
+/// Find FASTQ pair for a sample ID, trying common naming patterns
 fn find_fastq_pair(base_dir: &Path, id: &str) -> Result<(PathBuf, PathBuf)> {
-
+    // Common FASTQ naming patterns: {id}_R1.fastq.gz, {id}_1.fq.gz, etc.
     let patterns = [
         ("_R1.fastq.gz", "_R2.fastq.gz"),
         ("_R1.fq.gz", "_R2.fq.gz"),
@@ -716,10 +969,10 @@ fn parse_samples(args: &Args) -> Result<Vec<Sample>> {
 
     if let Some(ref samples_path) = args.samples {
         if samples_path.is_dir() {
-
+            // Auto-detect FASTQ pairs in directory
             samples = find_samples_in_dir(samples_path)?;
         } else {
-
+            // Read sample IDs from file (one ID per line)
             let file = File::open(samples_path)
                 .with_context(|| format!("Failed to open samples file: {:?}", samples_path))?;
             let reader = BufReader::new(file);
@@ -741,7 +994,7 @@ fn parse_samples(args: &Args) -> Result<Vec<Sample>> {
             }
         }
     } else if let (Some(ref r1_str), Some(ref r2_str)) = (&args.r1, &args.r2) {
-
+        // Parse comma-separated file lists
         let r1_files: Vec<&str> = r1_str.split(',').collect();
         let r2_files: Vec<&str> = r2_str.split(',').collect();
 
@@ -753,6 +1006,8 @@ fn parse_samples(args: &Args) -> Result<Vec<Sample>> {
             let r1_path = PathBuf::from(r1.trim());
             let r2_path = PathBuf::from(r2.trim());
 
+            // Extract sample name from filename
+            // Handle .fastq.gz, .fq.gz, .fastq, .fq extensions
             let name = r1_path.file_stem()
                 .and_then(|s| s.to_str())
                 .map(|s| {
@@ -779,6 +1034,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
     let sample_dir = args.outdir.join(&sample.name);
     fs::create_dir_all(&sample_dir)?;
 
+    // Validate inputs
     if !sample.r1.exists() {
         anyhow::bail!("R1 file not found: {:?}", sample.r1);
     }
@@ -786,6 +1042,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         anyhow::bail!("R2 file not found: {:?}", sample.r2);
     }
 
+    // Step 1: Align and filter reads
     if args.verbose {
         eprintln!("  [1/6] Aligning reads to ARG database...");
     }
@@ -802,6 +1059,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
 
     let (filtered_r1, filtered_r2) = extract_read_pairs(&sample.r1, &sample.r2, &matching_reads, &sample_dir)?;
 
+    // Step 2: MEGAHIT assembly
     if args.verbose {
         eprintln!("  [2/6] Running MEGAHIT assembly...");
     }
@@ -821,18 +1079,23 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         eprintln!("        Contigs assembled: {}", contigs.len());
     }
 
+    // Step 3: Strict extension (conservative, high confidence)
     if args.verbose {
         eprintln!("  [3/6] Extending contigs (strict)...");
     }
     let mut strict_contigs = extend_contigs_strict(&contigs, &filtered_r1, &filtered_r2, &sample_dir, args)?;
 
+    // Rename contigs for consistency (contig_1, contig_2, ...)
+    // This ensures PAF query names match contig names in classify_genera
     for (i, c) in strict_contigs.iter_mut().enumerate() {
         c.name = format!("contig_{}", i + 1);
     }
 
+    // Write contigs for ARG detection
     let contigs_path = sample_dir.join("contigs_strict.fasta");
     write_contigs_simple(&strict_contigs, &contigs_path)?;
 
+    // Step 4: ARG detection
     if args.verbose {
         eprintln!("  [4/6] Detecting ARGs...");
     }
@@ -848,19 +1111,21 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         eprintln!("        ARGs detected: {}", unique_args.len());
     }
 
+    // Step 5: Genus classification (1st attempt with strict extension)
     if args.verbose {
         eprintln!("  [5/6] Classifying genera (strict)...");
     }
 
     let genus_results = classify_genera(&unique_args, &strict_contigs, args)?;
 
-    let min_flanking_for_resolve = 100;
+    // Identify unresolved ARGs (genus unknown or low confidence)
+    let min_flanking_for_resolve = 100; // Need at least 100bp flanking
     let unresolved_args: Vec<&ArgHit> = unique_args.iter()
         .filter(|hit| {
             genus_results.iter()
                 .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig)
                 .map(|g| {
-
+                    // Unresolved if: no genus OR insufficient flanking
                     g.genus.is_none() ||
                     (g.upstream_len < min_flanking_for_resolve && g.downstream_len < min_flanking_for_resolve)
                 })
@@ -868,6 +1133,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         })
         .collect();
 
+    // Step 6: Flexible extension for unresolved ARGs only
     let mut flexible_results: HashMap<String, GenusResult> = HashMap::new();
 
     if !unresolved_args.is_empty() {
@@ -875,6 +1141,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
             eprintln!("  [6/6] Extending {} unresolved contigs with Rust (flexible)...", unresolved_args.len());
         }
 
+        // Get contigs that need flexible extension
         let unresolved_contig_names: FxHashSet<String> = unresolved_args.iter()
             .map(|h| h.contig.clone())
             .collect();
@@ -885,9 +1152,10 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
             .collect();
 
         if !contigs_to_extend.is_empty() {
-
+            // Apply Rust extension
             let flexible_contigs = extend_contigs_flexible(&contigs_to_extend, &filtered_r1, &filtered_r2, &sample_dir, args)?;
 
+            // Re-classify with flexible contigs
             let flexible_genus = classify_genera(&unresolved_args.iter().map(|h| (*h).clone()).collect::<Vec<_>>(), &flexible_contigs, args)?;
 
             for result in flexible_genus {
@@ -901,15 +1169,17 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         }
     }
 
+    // Build result rows with extension_method
     let results: Vec<ResultRow> = unique_args.iter()
         .map(|hit| {
             let key = format!("{}:{}", hit.arg_name, hit.contig);
 
+            // Check if flexible extension was used and successful
             let (genus_info, ext_method) = if let Some(flex_result) = flexible_results.get(&key) {
                 if flex_result.genus.is_some() {
                     (flex_result.clone(), "flexible")
                 } else {
-
+                    // Flexible didn't help, use strict result
                     let strict = genus_results.iter()
                         .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig)
                         .cloned()
@@ -917,7 +1187,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                     (strict, "strict")
                 }
             } else {
-
+                // Use strict result
                 let strict = genus_results.iter()
                     .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig)
                     .cloned()
@@ -930,6 +1200,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                 .collect::<Vec<_>>()
                 .join(";");
 
+            // Specificity: convert 0-1 to 0-100 if needed
             let specificity = if genus_info.specificity <= 1.0 {
                 genus_info.specificity * 100.0
             } else {
@@ -963,11 +1234,12 @@ fn classify_genera(
     contigs: &[FastaRecord],
     args: &Args,
 ) -> Result<Vec<GenusResult>> {
-
+    // Build contig map
     let contig_map: HashMap<String, String> = contigs.iter()
         .map(|c| (c.name.split_whitespace().next().unwrap_or(&c.name).to_string(), c.seq.clone()))
         .collect();
 
+    // Build ArgPositions
     let positions: Vec<ArgPosition> = arg_hits.iter()
         .filter_map(|hit| {
             let contig_key = hit.contig.split_whitespace().next().unwrap_or(&hit.contig);
@@ -989,8 +1261,9 @@ fn classify_genera(
         return Ok(Vec::new());
     }
 
+    // Check if flanking database exists
     if !args.flanking_db.as_ref().unwrap().exists() {
-
+        // Return placeholder results if no flanking database
         if args.verbose {
             eprintln!("        Flanking database not found, skipping genus classification");
         }
@@ -999,6 +1272,7 @@ fn classify_genera(
                 let upstream_len = pos.arg_start.min(args.max_flanking);
                 let downstream_len = (pos.contig_len - pos.arg_end).min(args.max_flanking);
 
+                // Verify SNP for point mutation genes even without flanking DB
                 let snp_status = snp::verify_snp(
                     &pos.contig_seq,
                     &pos.arg_name,
@@ -1025,11 +1299,14 @@ fn classify_genera(
         return Ok(results);
     }
 
+    // Use GenusClassifier for minimap2-based classification
+    // Based on divergence analysis: intra-genus ~96% identity, inter-genus ~87%
+    // Use 90% threshold to distinguish genera
     let mut classifier = GenusClassifier::new(
         args.flanking_db.as_ref().unwrap(),
         &args.minimap2,
-        0.90,
-        100,
+        0.90,  // min_identity: 90% to distinguish intra vs inter-genus
+        100,   // min_align_len: require decent overlap
         args.max_flanking,
     )?;
 
@@ -1039,6 +1316,10 @@ fn classify_genera(
 fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
     let header = "Sample\tARG_Name\tARG_Class\tGenus\tConfidence\tSpecificity\tARG_Identity\tARG_Coverage\tContig_Len\tUpstream_Len\tDownstream_Len\tExtension_Method\tSNP_Status\tTop_Matches";
 
+    // By default, filter out WildType and NotCovered (not true resistance genes)
+    // WildType: SNP position checked but found wild-type allele (no resistance mutation)
+    // NotCovered: Flanking region not covered, cannot verify SNP status
+    // Use --all-hits to include these in output
     let output_results: Vec<_> = if args.all_hits {
         results.iter().collect()
     } else {
@@ -1049,6 +1330,7 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
 
     let excluded_count = results.len() - output_results.len();
 
+    // Output to directory/results.tsv
     let output_path = args.outdir.join("results.tsv");
     let mut output = BufWriter::new(File::create(&output_path)?);
 
@@ -1088,6 +1370,7 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Strict extension (conservative, high confidence) - uses exact k-mer matching
 fn extend_contigs_strict(
     contigs: &[FastaRecord],
     r1: &Path,
@@ -1095,7 +1378,7 @@ fn extend_contigs_strict(
     sample_dir: &Path,
     args: &Args,
 ) -> Result<Vec<FastaRecord>> {
-
+    // Strict mode: higher coverage requirement, lower branching tolerance
     let config = ExtenderConfig {
         kmer_size: args.ext_kmer_size,
         extension_step: args.ext_length,
@@ -1118,6 +1401,7 @@ fn extend_contigs_strict(
         .collect())
 }
 
+/// Flexible extension (aggressive) - for unresolved cases
 fn extend_contigs_flexible(
     contigs: &[FastaRecord],
     r1: &Path,
@@ -1125,7 +1409,7 @@ fn extend_contigs_flexible(
     sample_dir: &Path,
     args: &Args,
 ) -> Result<Vec<FastaRecord>> {
-
+    // Flexible mode: lower coverage, higher branching tolerance
     let config = ExtenderConfig {
         kmer_size: args.ext_kmer_size,
         extension_step: args.ext_length,
@@ -1153,6 +1437,7 @@ fn run_minimap2_reads(r1: &Path, r2: &Path, db: &Path, output_dir: &Path, minima
     let paf_r2 = output_dir.join("alignment_r2.paf");
     let paf_merged = output_dir.join("alignment.paf");
 
+    // Run R1 and R2 alignment in parallel (each uses threads/2)
     let threads_per_job = (threads / 2).max(1);
 
     let r1_owned = r1.to_path_buf();
@@ -1273,6 +1558,7 @@ fn normalize_read_name(name: &str) -> String {
 fn run_megahit(r1: &Path, r2: &Path, output_dir: &Path, megahit: &str, threads: usize) -> Result<PathBuf> {
     let megahit_dir = output_dir.join("megahit");
 
+    // MEGAHIT requires output dir to not exist
     if megahit_dir.exists() {
         fs::remove_dir_all(&megahit_dir)?;
     }
@@ -1302,6 +1588,7 @@ fn load_and_filter_contigs(path: &Path, min_len: usize) -> Result<Vec<FastaRecor
     Ok(reader.filter_map(|r| r.ok()).filter(|r| r.seq.len() >= min_len).collect())
 }
 
+/// Write contigs to FASTA file
 fn write_contigs_simple(contigs: &[FastaRecord], path: &Path) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     for contig in contigs {

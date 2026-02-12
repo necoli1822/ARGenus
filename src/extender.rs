@@ -1,3 +1,23 @@
+//! Contig Extender Module
+//!
+//! Provides k-mer based contig extension using paired-end reads.
+//! Extends assembled contigs by finding overlapping reads at contig edges.
+//!
+//! # Extension Modes
+//! - **Strict mode**: High coverage requirement, low branching tolerance.
+//!   Use for high-confidence extensions where accuracy is critical.
+//!   Parameters: `min_coverage=3`, `branching_threshold=0.1`, `max_n_ratio=0.02`
+//!
+//! - **Relaxed mode**: Lower coverage, higher branching tolerance.
+//!   Use for unresolved cases where longer extensions are needed.
+//!   Parameters: `min_coverage=2`, `branching_threshold=0.2`, `max_n_ratio=0.05`
+//!
+//! # Algorithm Overview
+//! 1. Build k-mer index from contig edges
+//! 2. Scan reads for matching k-mers
+//! 3. Collect extension candidates from overlapping reads
+//! 4. Build consensus sequence with branching detection
+//! 5. Repeat until no further extension possible
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -9,21 +29,38 @@ use std::sync::Mutex;
 
 use crate::seqio::{FastaRecord, FastqFile};
 
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Configuration parameters for contig extension.
+///
+/// # Strict vs Relaxed Mode
+/// Strict mode (default) prioritises accuracy over length.
+/// Relaxed mode allows more aggressive extension for difficult cases.
+///
+/// | Parameter           | Strict | Relaxed | Description                    |
+/// |---------------------|--------|---------|--------------------------------|
+/// | min_coverage        | 3      | 2       | Minimum read support           |
+/// | branching_threshold | 0.1    | 0.2     | Minor allele frequency for N   |
+/// | max_n_ratio         | 0.02   | 0.05    | Maximum allowed N proportion   |
 #[derive(Clone)]
 pub struct ExtenderConfig {
-
+    /// K-mer size for extension (default: 21).
     pub kmer_size: usize,
-
+    /// Number of edge k-mers to use from each end (default: 5).
     pub num_edge_kmers: usize,
-
+    /// Minimum read coverage for consensus building (default: 2).
     pub min_coverage: usize,
-
+    /// Branching threshold: if minor allele frequency >= this, mark as N (default: 0.2).
+    /// Lower values = stricter, fewer Ns allowed.
     pub branching_threshold: f64,
-
+    /// Maximum N ratio allowed in extension (default: 0.05).
+    /// Extensions exceeding this are rejected.
     pub max_n_ratio: f64,
-
+    /// Extension length per iteration in base pairs (default: 200).
     pub extension_step: usize,
-
+    /// Maximum consecutive failures before stopping (default: 2).
     pub max_consecutive_failures: usize,
 }
 
@@ -41,21 +78,34 @@ impl Default for ExtenderConfig {
     }
 }
 
+// ============================================================================
+// Results
+// ============================================================================
+
+/// Result of extension for a single contig.
 #[derive(Debug, Clone)]
 pub struct ExtendedContig {
-
+    /// Original contig name.
     pub name: String,
-
+    /// Extended sequence (original + extensions).
     pub extended_seq: String,
 }
 
+// ============================================================================
+// Contig Extender
+// ============================================================================
+
+/// K-mer based contig extender using paired-end reads.
+///
+/// Loads reads into memory for efficient repeated scanning.
+/// Supports both sequential and parallel extension strategies.
 pub struct ContigExtender {
     config: ExtenderConfig,
     reads: Vec<String>,
 }
 
 impl ContigExtender {
-
+    /// Creates a new contig extender with the given configuration.
     pub fn new(config: ExtenderConfig) -> Self {
         Self {
             config,
@@ -63,12 +113,21 @@ impl ContigExtender {
         }
     }
 
+    /// Loads paired-end reads into memory for extension.
+    ///
+    /// Reads are loaded in parallel from both files.
+    /// Both forward and reverse reads are stored for extension.
+    ///
+    /// # Arguments
+    /// * `r1_path` - Path to forward reads (R1)
+    /// * `r2_path` - Path to reverse reads (R2)
     pub fn load_reads(&mut self, r1_path: &Path, r2_path: &Path) -> Result<()> {
         eprintln!("Loading reads into memory...");
 
         let r1_owned = r1_path.to_path_buf();
         let r2_owned = r2_path.to_path_buf();
 
+        // Load R1 and R2 in parallel
         let handle_r1 = std::thread::spawn(move || -> Result<Vec<String>> {
             let mut reads = Vec::new();
             let mut reader = FastqFile::open(&r1_owned)?;
@@ -97,10 +156,21 @@ impl ContigExtender {
         Ok(())
     }
 
+    /// Extends all contigs using hybrid parallel strategy.
+    ///
+    /// Combines shared read scanning with parallel extension application.
+    /// This is the recommended method for most use cases.
+    ///
+    /// # Algorithm
+    /// 1. Build edge k-mer index for active contigs
+    /// 2. Parallel read scanning (shared across all contigs)
+    /// 3. Parallel extension application per contig
+    /// 4. Repeat until no contigs can be extended
     pub fn extend_contigs(&self, contigs: &[FastaRecord]) -> Result<Vec<ExtendedContig>> {
         let k = self.config.kmer_size;
         let max_failures = self.config.max_consecutive_failures;
 
+        // Use Arc<Mutex> for thread-safe state updates
         let states: Vec<Mutex<ContigState>> = contigs.iter().map(|c| {
             Mutex::new(ContigState {
                 name: c.name.clone(),
@@ -111,7 +181,7 @@ impl ContigExtender {
         }).collect();
 
         loop {
-
+            // Identify contigs that still need extension
             let active_indices: Vec<usize> = states.iter().enumerate()
                 .filter(|(_, s)| {
                     let s = s.lock().unwrap();
@@ -124,6 +194,7 @@ impl ContigExtender {
                 break;
             }
 
+            // Build edge k-mer index for active contigs
             let mut edge_kmers: FxHashMap<u64, Vec<(usize, bool, usize)>> = FxHashMap::default();
 
             for &idx in &active_indices {
@@ -133,6 +204,7 @@ impl ContigExtender {
                     continue;
                 }
 
+                // Index left edge k-mers
                 if state.left_failures < max_failures {
                     for offset in 0..self.config.num_edge_kmers.min(seq.len() - k + 1) {
                         if let Some(hash) = compute_kmer_hash(&seq[offset..offset+k]) {
@@ -141,6 +213,7 @@ impl ContigExtender {
                     }
                 }
 
+                // Index right edge k-mers
                 if state.right_failures < max_failures {
                     let seq_len = seq.len();
                     for offset in 0..self.config.num_edge_kmers.min(seq.len() - k + 1) {
@@ -152,6 +225,7 @@ impl ContigExtender {
                 }
             }
 
+            // Parallel read scanning with local buffers to reduce lock contention
             let left_candidates: Mutex<FxHashMap<usize, Vec<String>>> = Mutex::new(FxHashMap::default());
             let right_candidates: Mutex<FxHashMap<usize, Vec<String>>> = Mutex::new(FxHashMap::default());
 
@@ -160,6 +234,7 @@ impl ContigExtender {
                     return;
                 }
 
+                // Local buffers for this read
                 let mut local_left: FxHashMap<usize, Vec<String>> = FxHashMap::default();
                 let mut local_right: FxHashMap<usize, Vec<String>> = FxHashMap::default();
 
@@ -177,7 +252,7 @@ impl ContigExtender {
                                 };
 
                                 let (is_forward, is_revcomp) = check_kmer_match(kmer_seq, contig_kmer);
-                                drop(state);
+                                drop(state); // Release lock early
 
                                 if is_left {
                                     if is_forward && i > edge_offset {
@@ -210,6 +285,7 @@ impl ContigExtender {
                     }
                 }
 
+                // Merge local buffers to global (reduces lock contention)
                 if !local_left.is_empty() {
                     let mut global = left_candidates.lock().unwrap();
                     for (idx, candidates) in local_left {
@@ -227,11 +303,13 @@ impl ContigExtender {
             let left_candidates = left_candidates.into_inner().unwrap();
             let right_candidates = right_candidates.into_inner().unwrap();
 
+            // Parallel extension application
             let any_extended = std::sync::atomic::AtomicBool::new(false);
 
             active_indices.par_iter().for_each(|&idx| {
                 let mut state = states[idx].lock().unwrap();
 
+                // Try left extension
                 if state.left_failures < max_failures {
                     if let Some(candidates) = left_candidates.get(&idx) {
                         if candidates.len() >= self.config.min_coverage {
@@ -263,6 +341,7 @@ impl ContigExtender {
                     }
                 }
 
+                // Try right extension
                 if state.right_failures < max_failures {
                     if let Some(candidates) = right_candidates.get(&idx) {
                         if candidates.len() >= self.config.min_coverage {
@@ -300,6 +379,7 @@ impl ContigExtender {
             }
         }
 
+        // Convert states to results
         let results = states.into_iter().map(|s| {
             let s = s.into_inner().unwrap();
             ExtendedContig {
@@ -311,12 +391,18 @@ impl ContigExtender {
         Ok(results)
     }
 
+    /// Alias for extend_contigs() - hybrid parallel method.
     #[inline]
     pub fn extend_all_hybrid(&self, contigs: &[FastaRecord]) -> Result<Vec<ExtendedContig>> {
         self.extend_contigs(contigs)
     }
 }
 
+// ============================================================================
+// Internal State
+// ============================================================================
+
+/// Internal state for each contig during extension.
 struct ContigState {
     name: String,
     current_seq: String,
@@ -324,6 +410,13 @@ struct ContigState {
     right_failures: usize,
 }
 
+// ============================================================================
+// K-mer Utilities
+// ============================================================================
+
+/// Computes canonical k-mer hash (minimum of forward and reverse complement).
+///
+/// Returns None if the k-mer contains non-ATGC characters.
 fn compute_kmer_hash(kmer: &str) -> Option<u64> {
     let bytes = kmer.as_bytes();
     let mut forward = 0u64;
@@ -344,6 +437,9 @@ fn compute_kmer_hash(kmer: &str) -> Option<u64> {
     Some(forward.min(reverse))
 }
 
+/// Checks if a read k-mer matches a contig k-mer (forward or reverse complement).
+///
+/// Returns (is_forward_match, is_reverse_complement_match).
 fn check_kmer_match(read_kmer: &str, contig_kmer: &str) -> (bool, bool) {
     let is_forward = read_kmer == contig_kmer;
     let is_revcomp = if is_forward {
@@ -354,6 +450,7 @@ fn check_kmer_match(read_kmer: &str, contig_kmer: &str) -> (bool, bool) {
     (is_forward, is_revcomp)
 }
 
+/// Computes the reverse complement of a DNA sequence.
 fn reverse_complement(seq: &str) -> String {
     seq.chars()
         .rev()
@@ -367,6 +464,20 @@ fn reverse_complement(seq: &str) -> String {
         .collect()
 }
 
+// ============================================================================
+// Consensus Building
+// ============================================================================
+
+/// Builds consensus sequence from multiple extension candidates.
+///
+/// Uses positional voting with branching detection.
+/// Positions with minor allele frequency >= threshold are marked as N.
+///
+/// # Arguments
+/// * `sequences` - Extension candidates from overlapping reads
+/// * `min_coverage` - Minimum bases required at each position
+/// * `branching_threshold` - Minor allele frequency threshold for N
+/// * `max_len` - Maximum consensus length
 fn build_consensus_sequence(
     sequences: &[String],
     min_coverage: usize,
@@ -381,7 +492,7 @@ fn build_consensus_sequence(
     let mut result = String::new();
 
     for i in 0..actual_max_len {
-
+        // Collect bases at this position
         let bases: Vec<char> = sequences
             .iter()
             .filter_map(|s| s.chars().nth(i))
@@ -392,7 +503,8 @@ fn build_consensus_sequence(
             break;
         }
 
-        let mut counts = [0usize; 4];
+        // Count base frequencies
+        let mut counts = [0usize; 4]; // A, T, G, C
         for &b in &bases {
             match b.to_ascii_uppercase() {
                 'A' => counts[0] += 1,
@@ -409,13 +521,15 @@ fn build_consensus_sequence(
             .map(|(i, _)| i)
             .unwrap_or(0);
 
+        // Check for branching (second most common base)
         let mut sorted_counts = counts;
         sorted_counts.sort_by(|a, b| b.cmp(a));
         let second_count = sorted_counts[1];
         let minor_freq = second_count as f64 / total as f64;
 
+        // Determine consensus base
         let base = if minor_freq >= branching_threshold {
-            'N'
+            'N' // Ambiguous position
         } else {
             match max_idx {
                 0 => 'A',
@@ -432,6 +546,15 @@ fn build_consensus_sequence(
     result
 }
 
+// ============================================================================
+// Output Functions
+// ============================================================================
+
+/// Writes extended contigs to a FASTA file.
+///
+/// # Arguments
+/// * `results` - Extended contig results
+/// * `path` - Output file path
 pub fn write_extended_contigs(results: &[ExtendedContig], path: &Path) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
 
@@ -443,20 +566,26 @@ pub fn write_extended_contigs(results: &[ExtendedContig], path: &Path) -> Result
     Ok(())
 }
 
+// ============================================================================
+// Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_compute_kmer_hash() {
-
+        // Same k-mer should produce same hash
         let h1 = compute_kmer_hash("ATGC").unwrap();
         let h2 = compute_kmer_hash("ATGC").unwrap();
         assert_eq!(h1, h2);
 
+        // Reverse complement should produce same canonical hash
         let h3 = compute_kmer_hash("GCAT").unwrap();
         assert_eq!(h1, h3);
 
+        // K-mer with N should return None
         assert!(compute_kmer_hash("ATNG").is_none());
     }
 

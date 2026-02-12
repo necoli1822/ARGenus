@@ -1,3 +1,21 @@
+//! PAF to FDB Converter
+//!
+//! Converts PAF alignment results to Flanking Database (FDB) format
+//! by extracting flanking sequences from genome files.
+//!
+//! Outputs:
+//!   - flanking_db.tsv: FDB with metadata and sequences
+//!   - flanking.fas: FASTA for minimap2 indexing
+//!   - flanking.mmi: minimap2 index (optional, requires minimap2)
+//!
+//! Usage:
+//!   cargo run --release --bin paf_to_fdb -- \
+//!     -p input.paf \
+//!     -g genomes_dir \
+//!     -c genome_catalog.tsv \
+//!     -o output_dir \
+//!     -n 1050 \
+//!     -t 32
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -9,6 +27,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+/// PAF hit for flanking extraction
 #[derive(Clone, Debug)]
 struct PafHit {
     contig_id: String,
@@ -26,6 +45,7 @@ impl PafHit {
             return None;
         }
 
+        // Query: contig_id|genome_file.fna
         let query = fields[0];
         let (contig_id, genome_file) = if let Some(pipe_pos) = query.rfind('|') {
             (query[..pipe_pos].to_string(), query[pipe_pos + 1..].to_string())
@@ -37,6 +57,7 @@ impl PafHit {
         let query_end: usize = fields[3].parse().ok()?;
         let strand = fields[4].chars().next().unwrap_or('+');
 
+        // Target: gene_name|class|drug|atc
         let target = fields[5];
         let gene_name = target.split('|').next()?.to_string();
 
@@ -51,6 +72,7 @@ impl PafHit {
     }
 }
 
+/// Flanking entry for output (Upstream + ARG + Downstream as single sequence)
 struct FlankingEntry {
     gene: String,
     contig: String,
@@ -58,9 +80,10 @@ struct FlankingEntry {
     start: usize,
     end: usize,
     strand: char,
-    sequence: String,
+    sequence: String,  // Upstream + ARG + Downstream
 }
 
+/// Genome catalog for taxonomy lookup
 struct GenomeCatalog {
     accession_to_genus: FxHashMap<String, String>,
 }
@@ -112,16 +135,19 @@ impl GenomeCatalog {
     }
 }
 
+/// Extract flanking sequences from a genome file
+/// Returns: Upstream(flanking_length) + ARG + Downstream(flanking_length)
 fn extract_flanking_from_genome(
     genome_path: &Path,
     hits: &[PafHit],
     catalog: &GenomeCatalog,
     flanking_length: usize,
 ) -> Result<Vec<FlankingEntry>> {
-
+    // Read genome FASTA
     let file = File::open(genome_path)?;
     let reader = BufReader::new(file);
 
+    // Parse FASTA: contig_id -> sequence
     let mut contigs: FxHashMap<String, String> = FxHashMap::default();
     let mut current_id: Option<String> = None;
     let mut current_seq = String::new();
@@ -142,23 +168,29 @@ fn extract_flanking_from_genome(
         contigs.insert(id, current_seq);
     }
 
+    // Get genus from catalog
     let genome_file = genome_path.file_name().unwrap().to_str().unwrap();
     let genus = catalog.get_genus(genome_file).to_string();
 
+    // Extract flanking for each hit
     let mut entries = Vec::new();
     for hit in hits {
         if let Some(seq) = contigs.get(&hit.contig_id) {
             let seq_len = seq.len();
 
+            // Bounds check
             if hit.query_start >= seq_len || hit.query_end > seq_len {
                 continue;
             }
 
+            // Calculate extraction range: Upstream + ARG + Downstream
             let extract_start = hit.query_start.saturating_sub(flanking_length);
             let extract_end = std::cmp::min(hit.query_end + flanking_length, seq_len);
 
+            // Extract full sequence (Upstream + ARG + Downstream)
             let full_sequence = seq[extract_start..extract_end].to_string();
 
+            // For negative strand, reverse complement the entire sequence
             let final_sequence = if hit.strand == '-' {
                 reverse_complement(&full_sequence)
             } else {
@@ -180,6 +212,7 @@ fn extract_flanking_from_genome(
     Ok(entries)
 }
 
+/// Reverse complement a DNA sequence
 fn reverse_complement(seq: &str) -> String {
     seq.chars()
         .rev()
@@ -194,6 +227,7 @@ fn reverse_complement(seq: &str) -> String {
         .collect()
 }
 
+/// Build minimap2 index from FASTA
 fn build_mmi_index(fasta_path: &Path, mmi_path: &Path) -> Result<bool> {
     eprintln!("\n[4] Building minimap2 index...");
 
@@ -223,6 +257,7 @@ fn build_mmi_index(fasta_path: &Path, mmi_path: &Path) -> Result<bool> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // Parse arguments
     let mut paf_path: Option<PathBuf> = None;
     let mut genomes_dir: Option<PathBuf> = None;
     let mut catalog_path: Option<PathBuf> = None;
@@ -278,6 +313,7 @@ fn main() -> Result<()> {
     let catalog_path = catalog_path.context("Missing -c/--catalog argument")?;
     let output_dir = output_dir.context("Missing -o/--output argument")?;
 
+    // Create output directory if needed
     std::fs::create_dir_all(&output_dir)?;
 
     let fdb_path = output_dir.join("flanking_db.tsv");
@@ -293,15 +329,18 @@ fn main() -> Result<()> {
     eprintln!("Threads: {}", threads);
     eprintln!();
 
+    // Set thread pool
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()?;
 
     let start_time = Instant::now();
 
+    // [1] Load genome catalog
     eprintln!("[1] Loading genome catalog...");
     let catalog = GenomeCatalog::load(&catalog_path)?;
 
+    // [2] Parse PAF and group by genome file
     eprintln!("\n[2] Parsing PAF file...");
     let paf_file = File::open(&paf_path)?;
     let reader = BufReader::new(paf_file);
@@ -321,6 +360,7 @@ fn main() -> Result<()> {
 
     eprintln!("    Parsed {} hits from {} genomes", total_hits, genome_hits.len());
 
+    // [3] Extract flanking sequences in parallel
     eprintln!("\n[3] Extracting flanking sequences (Upstream + ARG + Downstream)...");
     let processed = AtomicUsize::new(0);
     let extracted = AtomicUsize::new(0);
@@ -360,12 +400,14 @@ fn main() -> Result<()> {
 
     eprintln!();
 
+    // Write FDB (TSV) and FASTA simultaneously
     eprintln!("\n    Writing FDB and FASTA...");
     let fdb_file = File::create(&fdb_path)?;
     let fasta_file = File::create(&fasta_path)?;
     let mut fdb_writer = BufWriter::new(fdb_file);
     let mut fasta_writer = BufWriter::new(fasta_file);
 
+    // FDB header
     writeln!(fdb_writer, "Gene\tContig\tGenus\tStart\tEnd\tStrand\tSequence")?;
 
     let mut total_written = 0usize;
@@ -373,7 +415,7 @@ fn main() -> Result<()> {
 
     for entries in results {
         for entry in entries {
-
+            // Write FDB entry
             writeln!(
                 fdb_writer,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -386,6 +428,8 @@ fn main() -> Result<()> {
                 entry.sequence
             )?;
 
+            // Write FASTA entry
+            // Header: >ID|Gene|Contig|Genus|Start|End|Strand
             writeln!(
                 fasta_writer,
                 ">{}|{}|{}|{}|{}|{}|{}",
@@ -411,10 +455,12 @@ fn main() -> Result<()> {
     eprintln!("    FDB: {} ({} entries)", fdb_path.display(), total_written);
     eprintln!("    FASTA: {}", fasta_path.display());
 
+    // [4] Build minimap2 index
     let mut mmi_created = false;
     if !skip_mmi {
         mmi_created = build_mmi_index(&fasta_path, &mmi_path)?;
 
+        // Remove intermediate FASTA file after successful mmi creation
         if mmi_created {
             std::fs::remove_file(&fasta_path)?;
             eprintln!("    Removed intermediate FASTA file");
@@ -425,6 +471,7 @@ fn main() -> Result<()> {
 
     let elapsed = start_time.elapsed().as_secs_f64();
 
+    // Summary
     eprintln!();
     eprintln!("=== Complete ===");
     eprintln!("Time: {:.1}s", elapsed);

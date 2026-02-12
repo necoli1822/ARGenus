@@ -1,3 +1,32 @@
+//! ARG Reference Database Builder Module
+//!
+//! Downloads and builds antimicrobial resistance gene (ARG) reference databases
+//! from NCBI AMRFinderPlus or CARD (Comprehensive Antibiotic Resistance Database).
+//!
+//! # Architecture
+//! - Nucleotide-based sequences (not protein-based)
+//! - Metadata embedded in FASTA headers
+//! - Proper deduplication with taxa tracking
+//!
+//! # Output Files
+//! - `AMR_NCBI.fas` or `AMR_CARD.fas`: FASTA sequences (for minimap2 alignment)
+//! - `AMR_NCBI.mmi` or `AMR_CARD.mmi`: minimap2 pre-built index
+//!
+//! # Data Sources
+//! - **NCBI**: Official AMRFinderPlus database with curated gene names
+//! - **CARD**: Comprehensive database with ~94% NCBI gene name mapping
+//!
+//! # Example
+//! ```no_run
+//! use argenus::arg_db;
+//! use std::path::Path;
+//!
+//! // Build from NCBI (recommended)
+//! arg_db::build(Path::new("./db"), "ncbi", 32).unwrap();
+//!
+//! // Build from CARD (includes CARD-only genes marked with '^')
+//! arg_db::build(Path::new("./db"), "card", 32).unwrap();
+//! ```
 
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -9,53 +38,61 @@ use std::time::Duration;
 
 const NCBI_FTP_BASE: &str = "https://ftp.ncbi.nlm.nih.gov/pathogen/Antimicrobial_resistance/AMRFinderPlus/database/latest";
 const CARD_DATA_URL: &str = "https://card.mcmaster.ca/latest/data";
-
+// PanRes files from Zenodo: https://doi.org/10.5281/zenodo.8055115
 const PANRES_FASTA_URL: &str = "https://zenodo.org/records/8055116/files/PanRes_genes_v1.0.0.fa?download=1";
 const PANRES_TSV_URL: &str = "https://zenodo.org/records/8055116/files/PanRes_data_v1.0.0.tsv?download=1";
 
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+/// Gene metadata for FASTA header generation.
 #[derive(Clone, Debug)]
 struct GeneMeta {
-
+    /// Gene family grouping (for CARD-only detection).
     gene_family: String,
-
+    /// NDARO drug class (e.g., "BETA-LACTAM").
     drug_class: String,
-
+    /// Chemical class of target antibiotic.
     chemical_class: String,
-
+    /// ATC (Anatomical Therapeutic Chemical) code.
     atc_code: String,
 }
 
+/// ARG metadata collected during build.
 #[derive(Clone, Debug)]
 struct ArgMetaDb {
-
+    /// Total number of genes.
     gene_count: usize,
-
+    /// Total taxa entries across all genes (for statistics).
     #[allow(dead_code)]
     total_taxa_entries: usize,
-
+    /// Gene metadata indexed by gene_id.
     genes: FxHashMap<String, GeneMeta>,
 }
 
+/// Catalogue entry parsed from NCBI ReferenceGeneCatalog.txt.
 #[derive(Clone, Debug)]
 struct CatalogueEntry {
-
+    /// Protein accession (RefSeq or GenBank). Empty for nucleotide-only entries.
     protein_accession: String,
-
+    /// Allele name (e.g., gyrA_S83F for point mutations).
     allele: String,
-
+    /// Gene family name (e.g., gyrA).
     gene_family: String,
-
+    /// NDARO drug class.
     ndaro_class: String,
-
+    /// Subtype (e.g., "AMR", "POINT").
     subtype: String,
-
+    /// Nucleotide accession for coordinate-based fetch (16S, etc.).
     nucleotide_accession: Option<String>,
-
+    /// Coordinates for nucleotide-based fetch.
     nuc_start: Option<u64>,
     nuc_stop: Option<u64>,
     nuc_strand: Option<String>,
 }
 
+/// CARD gene entry with metadata.
 #[derive(Clone, Debug)]
 struct CardGeneEntry {
     card_name: String,
@@ -64,6 +101,14 @@ struct CardGeneEntry {
     drug_class: String,
 }
 
+// ============================================================================
+// Drug Class Mapping
+// ============================================================================
+
+/// Maps NDARO drug class to chemical class and ATC code.
+///
+/// ATC (Anatomical Therapeutic Chemical) classification provides
+/// standardised drug categorisation for international use.
 fn get_chemical_and_atc(ndaro_class: &str) -> (&'static str, &'static str) {
     match ndaro_class {
         "AMINOGLYCOSIDE" => ("AMINOGLYCOSIDE", "J01G"),
@@ -94,6 +139,7 @@ fn get_chemical_and_atc(ndaro_class: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Maps CARD drug class to NDARO-style class.
 fn card_to_ndaro_class(card_class: &str) -> &'static str {
     let card_lower = card_class.to_lowercase();
 
@@ -122,6 +168,13 @@ fn card_to_ndaro_class(card_class: &str) -> &'static str {
     "MULTIDRUG"
 }
 
+// ============================================================================
+// File Download
+// ============================================================================
+
+/// Fetches a file from a URL to the specified output path.
+///
+/// Uses ureq with a 5-minute timeout for large files.
 fn fetch_file(url: &str, output_path: &Path) -> Result<()> {
     eprintln!("  Downloading {}...", output_path.file_name().unwrap().to_string_lossy());
 
@@ -137,6 +190,11 @@ fn fetch_file(url: &str, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fetches and extracts CARD database archive.
+///
+/// CARD provides data as tar.bz2 containing:
+/// - nucleotide_fasta_protein_homolog_model.fasta
+/// - aro_index.tsv (metadata)
 fn fetch_card_data(output_dir: &Path) -> Result<()> {
     use bzip2::read::BzDecoder;
     use tar::Archive;
@@ -159,6 +217,14 @@ fn fetch_card_data(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// NCBI Parsing
+// ============================================================================
+
+/// Parses NCBI ReferenceGeneCatalog.txt for ARG entries.
+///
+/// Filters for type='AMR' and excludes susceptible reference sequences.
+/// Returns entries keyed by protein accession (or allele for nucleotide-only entries).
 fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, CatalogueEntry>> {
     eprintln!("[2] Parsing ReferenceGeneCatalog.txt...");
 
@@ -166,6 +232,7 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
+    // Parse header to find column indices
     let header = lines.next().ok_or_else(|| anyhow::anyhow!("Empty catalogue file"))??;
     let columns: Vec<&str> = header.split('\t').collect();
 
@@ -203,10 +270,12 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
             continue;
         }
 
+        // Filter for type='AMR' only
         if fields[idx_type] != "AMR" {
             continue;
         }
 
+        // Skip AMR-SUSCEPTIBLE (susceptible reference sequences)
         if fields[idx_subtype] == "AMR-SUSCEPTIBLE" {
             continue;
         }
@@ -224,6 +293,7 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
         let ndaro_class = fields[idx_class].to_string();
         let subtype = fields[idx_subtype].to_string();
 
+        // Determine nucleotide accession (prefer RefSeq, fallback to GenBank)
         let nuc_acc = if !refseq_nuc.is_empty() {
             Some(refseq_nuc.to_string())
         } else if !genbank_nuc.is_empty() {
@@ -232,6 +302,7 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
             None
         };
 
+        // Create entry with nucleotide info
         let create_entry = |prot_acc: &str| CatalogueEntry {
             protein_accession: prot_acc.to_string(),
             allele: allele.clone(),
@@ -244,6 +315,9 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
             nuc_strand: if !genbank_strand.is_empty() { Some(genbank_strand.to_string()) } else { None },
         };
 
+        // Handle entries with protein accession
+        // Key by allele (or gene_family if allele is empty) to preserve all POINT mutations
+        // that share the same protein accession
         if !refseq_prot.is_empty() || !genbank_prot.is_empty() {
             let key = if !allele.is_empty() { allele.clone() } else { gene_family.clone() };
             let prot_acc = if !refseq_prot.is_empty() { refseq_prot } else { genbank_prot };
@@ -251,7 +325,7 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
                 entries.insert(key, create_entry(prot_acc));
             }
         }
-
+        // Handle nucleotide-only entries (e.g., 16S rRNA mutations) - key by allele
         else if nuc_acc.is_some() && genbank_start.is_some() && genbank_stop.is_some() && !allele.is_empty() {
             let key = format!("NUC:{}", allele);
             if !entries.contains_key(&key) {
@@ -276,6 +350,9 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
     Ok(entries)
 }
 
+/// Parses AMR_CDS.fa file to extract gene sequences.
+///
+/// Maps protein accession to their nucleotide sequences for reliable matching.
 fn parse_arg_sequences(fasta_path: &Path) -> Result<FxHashMap<String, String>> {
     eprintln!("[3] Parsing AMR_CDS.fa...");
 
@@ -289,13 +366,15 @@ fn parse_arg_sequences(fasta_path: &Path) -> Result<FxHashMap<String, String>> {
     for line in reader.lines() {
         let line = line?;
         if line.starts_with('>') {
-
+            // Save previous sequence
             if let Some(prot_acc) = current_prot_acc.take() {
                 if !current_seq.is_empty() {
                     sequences.insert(prot_acc, std::mem::take(&mut current_seq));
                 }
             }
 
+            // Parse protein accession from header (first field)
+            // Format: >PROT_ACC|NUC_ACC|...|GENE_NAME|GENE_NAME|description
             let header = line.trim_start_matches('>');
             let parts: Vec<&str> = header.split('|').collect();
             if let Some(first) = parts.first() {
@@ -307,6 +386,7 @@ fn parse_arg_sequences(fasta_path: &Path) -> Result<FxHashMap<String, String>> {
         }
     }
 
+    // Save last sequence
     if let Some(prot_acc) = current_prot_acc {
         if !current_seq.is_empty() {
             sequences.insert(prot_acc, current_seq);
@@ -317,11 +397,20 @@ fn parse_arg_sequences(fasta_path: &Path) -> Result<FxHashMap<String, String>> {
     Ok(sequences)
 }
 
+/// Fetches missing sequences from NCBI using E-utilities API.
+///
+/// Strategy:
+/// 1. For protein accessions (WP_, NP_, etc.): Try db=protein with rettype=fasta_cds_na
+/// 2. For WP_ accessions that fail: Use IPG (Identical Protein Groups) to find linked CDS
+/// 3. For nucleotide accessions (NG_, NC_, etc.): Use db=nucleotide with rettype=fasta
+///
+/// Uses batch requests (max 200 IDs per request) to efficiently download.
 fn fetch_missing_cds(accessions: &[String]) -> Result<FxHashMap<String, String>> {
     if accessions.is_empty() {
         return Ok(FxHashMap::default());
     }
 
+    // Separate protein vs nucleotide accessions
     let protein_prefixes = ["WP_", "NP_", "YP_", "XP_", "AAA", "AAB", "AAC", "AAD", "AAE",
                            "AAF", "AAG", "AAH", "AAI", "AAK", "AAL", "AAM", "AAN", "AAO",
                            "CAA", "BAA", "EAA", "P", "Q"];
@@ -339,6 +428,7 @@ fn fetch_missing_cds(accessions: &[String]) -> Result<FxHashMap<String, String>>
     let mut sequences: FxHashMap<String, String> = FxHashMap::default();
     let batch_size = 200;
 
+    // Fetch protein CDS sequences (standard method)
     if !protein_accs.is_empty() {
         for (batch_idx, chunk) in protein_accs.chunks(batch_size).enumerate() {
             let ids = chunk.join(",");
@@ -358,6 +448,7 @@ fn fetch_missing_cds(accessions: &[String]) -> Result<FxHashMap<String, String>>
             }
         }
 
+        // For WP_ accessions that failed, try IPG method
         let wp_failed: Vec<_> = protein_accs.iter()
             .filter(|acc| acc.starts_with("WP_") && !sequences.contains_key(*acc))
             .cloned()
@@ -369,6 +460,7 @@ fn fetch_missing_cds(accessions: &[String]) -> Result<FxHashMap<String, String>>
         }
     }
 
+    // Fetch nucleotide sequences (NG_, NC_, CP, etc.)
     if !nucleotide_accs.is_empty() {
         eprintln!("      Fetching nucleotide sequences...");
         for (batch_idx, chunk) in nucleotide_accs.chunks(batch_size).enumerate() {
@@ -400,22 +492,33 @@ fn fetch_missing_cds(accessions: &[String]) -> Result<FxHashMap<String, String>>
     Ok(sequences)
 }
 
+/// Fetches CDS for WP_ accessions using IPG (Identical Protein Groups).
+///
+/// WP_ accessions are non-redundant proteins without direct CDS links.
+/// IPG provides linked nucleotide accessions with coordinates.
+///
+/// Two-phase approach:
+/// 1. Batch fetch IPG data using epost+efetch (much faster than individual queries)
+/// 2. Fetch CDS sequences using coordinates (sequential due to coordinate-based queries)
 fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String>) {
     if wp_accs.is_empty() {
         return;
     }
 
+    // Phase 1: Batch fetch IPG data using epost + efetch
     eprintln!("        Fetching IPG data for {} WP_ accessions...", wp_accs.len());
 
+    // Build lookup set for filtering
     let wp_set: FxHashSet<&str> = wp_accs.iter().map(|s| s.as_str()).collect();
     let mut coord_map: FxHashMap<String, (String, usize, usize, char)> = FxHashMap::default();
-    let batch_size = 50;
+    let batch_size = 50; // Smaller batches to avoid huge IPG responses
 
     for (batch_idx, chunk) in wp_accs.chunks(batch_size).enumerate() {
         if batch_idx > 0 {
             std::thread::sleep(Duration::from_millis(500));
         }
 
+        // Step 1: epost to submit IDs
         let ids = chunk.join(",");
         let epost_url = format!(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/epost.fcgi?db=protein&id={}",
@@ -432,6 +535,7 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
             Err(_) => continue,
         };
 
+        // Parse WebEnv and QueryKey from XML response
         let webenv = epost_body
             .split("<WebEnv>").nth(1)
             .and_then(|s| s.split("</WebEnv>").next())
@@ -448,6 +552,7 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
 
         std::thread::sleep(Duration::from_millis(350));
 
+        // Step 2: efetch with IPG format
         let efetch_url = format!(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=protein&query_key={}&WebEnv={}&rettype=ipg&retmode=text",
             query_key, webenv
@@ -458,9 +563,12 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
             Err(_) => continue,
         };
 
+        // Use reader to handle large responses
         let reader = BufReader::new(efetch_resp.into_reader());
         let mut line_count = 0;
 
+        // Parse IPG data - Format: Id\tSource\tNucleotide Accession\tStart\tStop\tStrand\tProtein\t...
+        // Column 6 (index 6) is the Protein accession we need to match
         for line_result in reader.lines() {
             let line = match line_result {
                 Ok(l) => l,
@@ -469,6 +577,7 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
 
             line_count += 1;
 
+            // Skip header line
             if line_count == 1 {
                 continue;
             }
@@ -482,20 +591,22 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
                 let strand_char = fields[5].chars().next();
                 let prot_acc = fields[6];
 
+                // Only process if this protein accession is in our requested list
                 if !wp_set.contains(prot_acc) {
                     continue;
                 }
 
+                // Skip if already found
                 if coord_map.contains_key(prot_acc) {
                     continue;
                 }
 
                 if let (Some(s), Some(e), Some(c)) = (start, stop, strand_char) {
-
+                    // Prefer RefSeq (NC_, NZ_)
                     if source == "RefSeq" && (nuc_acc.starts_with("NC_") || nuc_acc.starts_with("NZ_")) {
                         coord_map.insert(prot_acc.to_string(), (nuc_acc.to_string(), s, e, c));
                     }
-
+                    // Use INSDC as fallback if no RefSeq yet
                     else if source == "INSDC" {
                         coord_map.insert(prot_acc.to_string(), (nuc_acc.to_string(), s, e, c));
                     }
@@ -510,6 +621,7 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
 
     eprintln!("        Found coordinates for {}/{} WP_ accessions", coord_map.len(), wp_accs.len());
 
+    // Fallback for failed accessions: individual IPG queries without filtering
     let failed: Vec<_> = wp_accs.iter().filter(|acc| !coord_map.contains_key(*acc)).cloned().collect();
     if !failed.is_empty() {
         eprintln!("        Retrying {} failed accessions individually...", failed.len());
@@ -518,6 +630,7 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
                 std::thread::sleep(Duration::from_millis(400));
             }
 
+            // Individual IPG query - take first valid coordinate
             let ipg_url = format!(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=protein&id={}&rettype=ipg&retmode=text",
                 wp_acc
@@ -526,7 +639,7 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
             if let Ok(resp) = ureq::get(&ipg_url).timeout(Duration::from_secs(30)).call() {
                 let reader = BufReader::new(resp.into_reader());
                 for (line_idx, line_result) in reader.lines().enumerate() {
-                    if line_idx == 0 { continue; }
+                    if line_idx == 0 { continue; } // Skip header
 
                     if let Ok(line) = line_result {
                         let fields: Vec<&str> = line.split('\t').collect();
@@ -537,13 +650,14 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
                             let stop: Option<usize> = fields[4].parse().ok();
                             let strand_char = fields[5].chars().next();
 
+                            // Take first valid coordinate (prefer RefSeq, then INSDC)
                             if let (Some(s), Some(e), Some(c)) = (start, stop, strand_char) {
                                 if source == "RefSeq" && (nuc_acc.starts_with("NC_") || nuc_acc.starts_with("NZ_")) {
                                     coord_map.insert(wp_acc.clone(), (nuc_acc.to_string(), s, e, c));
                                     break;
                                 } else if source == "INSDC" && !coord_map.contains_key(wp_acc) {
                                     coord_map.insert(wp_acc.clone(), (nuc_acc.to_string(), s, e, c));
-
+                                    // Don't break yet - keep looking for RefSeq
                                 }
                             }
                         }
@@ -565,6 +679,7 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
 
     eprintln!("        Final coordinates: {}/{} WP_ accessions", coord_map.len(), wp_accs.len());
 
+    // Phase 2: Fetch CDS sequences using coordinates
     let coord_list: Vec<_> = wp_accs.iter()
         .filter_map(|wp| coord_map.get(wp).map(|(n, s, e, c)| (wp.clone(), n.clone(), *s, *e, *c)))
         .collect();
@@ -600,6 +715,10 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
     }
 }
 
+/// Fetches nucleotide sequences by coordinates for nucleotide-only entries.
+///
+/// For entries like 16S rRNA mutations that have no protein accession but have
+/// nucleotide accession with start/stop coordinates.
 fn fetch_by_coordinates(entries: &[(String, String, u64, u64, String)], sequences: &mut FxHashMap<String, String>) {
     if entries.is_empty() {
         return;
@@ -608,7 +727,7 @@ fn fetch_by_coordinates(entries: &[(String, String, u64, u64, String)], sequence
     eprintln!("      Fetching {} nucleotide-only sequences by coordinates...", entries.len());
 
     for (idx, (key, nuc_acc, start, stop, strand)) in entries.iter().enumerate() {
-
+        // Rate limiting
         if idx > 0 {
             std::thread::sleep(Duration::from_millis(350));
         }
@@ -621,7 +740,7 @@ fn fetch_by_coordinates(entries: &[(String, String, u64, u64, String)], sequence
 
         if let Ok(resp) = ureq::get(&fetch_url).timeout(Duration::from_secs(30)).call() {
             if let Ok(body) = resp.into_string() {
-
+                // Parse FASTA
                 let mut seq = String::new();
                 for line in body.lines() {
                     if !line.starts_with('>') {
@@ -634,19 +753,21 @@ fn fetch_by_coordinates(entries: &[(String, String, u64, u64, String)], sequence
             }
         }
 
+        // Progress update
         if (idx + 1) % 50 == 0 {
             eprintln!("        Coordinate fetch progress: {}/{}", idx + 1, entries.len());
         }
     }
 }
 
+/// Parses FASTA response and maps sequences to known accessions.
 fn parse_fasta_response(body: &str, known_accs: &[String], sequences: &mut FxHashMap<String, String>) {
     let mut current_acc: Option<String> = None;
     let mut current_seq = String::new();
 
     for line in body.lines() {
         if line.starts_with('>') {
-
+            // Save previous sequence
             if let Some(acc) = current_acc.take() {
                 if !current_seq.is_empty() {
                     sequences.insert(acc, std::mem::take(&mut current_seq));
@@ -655,6 +776,7 @@ fn parse_fasta_response(body: &str, known_accs: &[String], sequences: &mut FxHas
 
             let header = line.trim_start_matches('>');
 
+            // Try to match known accessions in header
             for acc in known_accs {
                 if header.contains(acc.as_str()) || header.starts_with(acc.as_str()) {
                     current_acc = Some(acc.clone());
@@ -667,6 +789,7 @@ fn parse_fasta_response(body: &str, known_accs: &[String], sequences: &mut FxHas
         }
     }
 
+    // Save last sequence
     if let Some(acc) = current_acc {
         if !current_seq.is_empty() {
             sequences.insert(acc, current_seq);
@@ -674,6 +797,9 @@ fn parse_fasta_response(body: &str, known_accs: &[String], sequences: &mut FxHas
     }
 }
 
+/// Builds protein accession → gene name mapping from NCBI catalogue.
+///
+/// Returns (protein_mapping, gene_name_set) for CARD gene name resolution.
 fn build_protein_accession_map(catalogue_path: &Path) -> Result<(FxHashMap<String, String>, FxHashSet<String>)> {
     eprintln!("    Building protein accession → gene name mapping...");
 
@@ -732,6 +858,16 @@ fn build_protein_accession_map(catalogue_path: &Path) -> Result<(FxHashMap<Strin
     Ok((mapping, gene_names))
 }
 
+// ============================================================================
+// CARD Parsing
+// ============================================================================
+
+/// Parses CARD database files and maps to NCBI gene names.
+///
+/// Attempts to resolve CARD gene names to NCBI names via:
+/// 1. Protein accession mapping (most reliable)
+/// 2. Case-insensitive name matching
+/// 3. "bla" prefix matching for beta-lactamases
 fn parse_card_entries(
     card_dir: &Path,
     ncbi_prot_mapping: &FxHashMap<String, String>,
@@ -739,11 +875,13 @@ fn parse_card_entries(
 ) -> Result<Vec<CardGeneEntry>> {
     eprintln!("[3] Parsing CARD database...");
 
+    // Build case-insensitive name lookup
     let ncbi_name_lower: FxHashMap<String, String> = ncbi_name_set
         .iter()
         .map(|n| (n.to_lowercase(), n.clone()))
         .collect();
 
+    // Parse ARO index for metadata
     let aro_path = card_dir.join("aro_index.tsv");
     let mut aro_metadata: FxHashMap<String, (String, String)> = FxHashMap::default();
 
@@ -751,7 +889,7 @@ fn parse_card_entries(
         let file = File::open(&aro_path)?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
-        lines.next();
+        lines.next(); // Skip header
 
         for line in lines {
             let line = line?;
@@ -766,6 +904,7 @@ fn parse_card_entries(
         eprintln!("    Loaded {} ARO metadata entries", aro_metadata.len());
     }
 
+    // Parse CARD FASTA (protein homolog model)
     let fasta_path = card_dir.join("nucleotide_fasta_protein_homolog_model.fasta");
     let mut entries: Vec<CardGeneEntry> = Vec::new();
 
@@ -779,7 +918,7 @@ fn parse_card_entries(
         for line in reader.lines() {
             let line = line?;
             if line.starts_with('>') {
-
+                // Save previous entry
                 if let Some(mut entry) = current_entry.take() {
                     entry.sequence = std::mem::take(&mut current_seq);
                     if !entry.sequence.is_empty() {
@@ -787,6 +926,7 @@ fn parse_card_entries(
                     }
                 }
 
+                // Parse CARD header
                 let header = line.trim_start_matches('>');
                 let parts: Vec<&str> = header.split('|').collect();
 
@@ -805,6 +945,7 @@ fn parse_card_entries(
                         .cloned()
                         .unwrap_or_else(|| ("UNKNOWN".to_string(), String::new()));
 
+                    // Try to map to NCBI gene name
                     let ncbi_name = ncbi_prot_mapping.get(&prot_acc).cloned()
                         .or_else(|| {
                             let bla_name = format!("bla{}", card_name);
@@ -849,6 +990,11 @@ fn parse_card_entries(
     Ok(entries)
 }
 
+// ============================================================================
+// Database Building
+// ============================================================================
+
+/// Builds gene database from CARD entries.
 fn build_from_card(card_entries: &[CardGeneEntry]) -> Result<(FxHashMap<String, String>, ArgMetaDb)> {
     eprintln!("[4] Building gene database from CARD...");
 
@@ -903,6 +1049,11 @@ fn build_from_card(card_entries: &[CardGeneEntry]) -> Result<(FxHashMap<String, 
     Ok((sequences, meta_db))
 }
 
+// ============================================================================
+// PanRes Parsing
+// ============================================================================
+
+/// PanRes gene entry with metadata.
 #[derive(Clone, Debug)]
 struct PanResGeneEntry {
     pan_id: String,
@@ -912,12 +1063,17 @@ struct PanResGeneEntry {
     sequence: String,
 }
 
+/// Parses PanRes database files.
+///
+/// PanRes is a combined ARG database from ARGprofiler project.
+/// It merges multiple sources (NCBI, CARD, ResFinder, etc.) into one unified database.
 fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
     eprintln!("[3] Parsing PanRes database...");
 
     let fasta_path = panres_dir.join("panres_genes.fa");
     let tsv_path = panres_dir.join("panres_data.tsv");
 
+    // Parse metadata TSV first
     let mut metadata: FxHashMap<String, (String, String, String)> = FxHashMap::default();
 
     if tsv_path.exists() {
@@ -935,6 +1091,7 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
                 let pan_id = fields[0].to_string();
                 let fa_header = if fields.len() > 4 { fields[4] } else { "" };
 
+                // Extract gene name from fa_header (format: ...|gene_name|gene_family|...)
                 let parts: Vec<&str> = fa_header.split('|').collect();
                 let (gene_name, gene_family) = if parts.len() >= 7 {
                     (parts[5].to_string(), parts[6].to_string())
@@ -942,6 +1099,7 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
                     (pan_id.clone(), pan_id.clone())
                 };
 
+                // Infer drug class from gene family or description
                 let drug_class = infer_drug_class_from_gene(&gene_name, &gene_family);
 
                 metadata.insert(pan_id, (gene_name, gene_family, drug_class));
@@ -950,6 +1108,7 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
         eprintln!("    Loaded {} metadata entries", metadata.len());
     }
 
+    // Parse FASTA sequences
     let mut entries: Vec<PanResGeneEntry> = Vec::new();
 
     if fasta_path.exists() {
@@ -962,7 +1121,7 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
         for line in reader.lines() {
             let line = line?;
             if line.starts_with('>') {
-
+                // Save previous entry
                 if let Some(pan_id) = current_id.take() {
                     if !current_seq.is_empty() {
                         let (gene_name, gene_family, drug_class) = metadata
@@ -980,6 +1139,7 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
                     }
                 }
 
+                // Parse new header
                 let header = line.trim_start_matches('>');
                 current_id = Some(header.split_whitespace().next().unwrap_or(header).to_string());
                 current_seq.clear();
@@ -988,6 +1148,7 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
             }
         }
 
+        // Save last entry
         if let Some(pan_id) = current_id {
             if !current_seq.is_empty() {
                 let (gene_name, gene_family, drug_class) = metadata
@@ -1010,10 +1171,12 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
     Ok(entries)
 }
 
+/// Infers drug class from gene name or family.
 fn infer_drug_class_from_gene(gene_name: &str, gene_family: &str) -> String {
     let name_lower = gene_name.to_lowercase();
     let family_lower = gene_family.to_lowercase();
 
+    // Beta-lactamases
     if name_lower.starts_with("bla") || family_lower.contains("beta-lactam")
         || name_lower.contains("oxa") || name_lower.contains("ctx")
         || name_lower.contains("tem") || name_lower.contains("shv")
@@ -1022,53 +1185,64 @@ fn infer_drug_class_from_gene(gene_name: &str, gene_family: &str) -> String {
         return "BETA-LACTAM".to_string();
     }
 
+    // Aminoglycosides
     if name_lower.starts_with("aac") || name_lower.starts_with("aph")
         || name_lower.starts_with("ant") || name_lower.starts_with("aad")
         || family_lower.contains("aminoglycoside") {
         return "AMINOGLYCOSIDE".to_string();
     }
 
+    // Tetracyclines
     if name_lower.starts_with("tet") || family_lower.contains("tetracycline") {
         return "TETRACYCLINE".to_string();
     }
 
+    // Macrolides
     if name_lower.starts_with("erm") || name_lower.starts_with("mef")
         || name_lower.starts_with("mph") || family_lower.contains("macrolide") {
         return "MACROLIDE".to_string();
     }
 
+    // Quinolones
     if name_lower.starts_with("qnr") || name_lower.contains("gyr")
         || family_lower.contains("quinolone") {
         return "QUINOLONE".to_string();
     }
 
+    // Sulfonamides
     if name_lower.starts_with("sul") || family_lower.contains("sulfonamide") {
         return "SULFONAMIDE".to_string();
     }
 
+    // Trimethoprim
     if name_lower.starts_with("dfr") || family_lower.contains("trimethoprim") {
         return "TRIMETHOPRIM".to_string();
     }
 
+    // Phenicols
     if name_lower.starts_with("cat") || name_lower.starts_with("cml")
         || name_lower.starts_with("flor") || family_lower.contains("phenicol") {
         return "PHENICOL".to_string();
     }
 
+    // Glycopeptides
     if name_lower.starts_with("van") || family_lower.contains("glycopeptide") {
         return "GLYCOPEPTIDE".to_string();
     }
 
+    // Colistin/Polymyxin
     if name_lower.starts_with("mcr") || family_lower.contains("colistin")
         || family_lower.contains("polymyxin") {
         return "COLISTIN".to_string();
     }
 
+    // Rifamycin
     if name_lower.starts_with("arr") || name_lower.contains("rpo")
         || family_lower.contains("rifamycin") {
         return "RIFAMYCIN".to_string();
     }
 
+    // Fosfomycin
     if name_lower.starts_with("fos") || family_lower.contains("fosfomycin") {
         return "FOSFOMYCIN".to_string();
     }
@@ -1076,6 +1250,7 @@ fn infer_drug_class_from_gene(gene_name: &str, gene_family: &str) -> String {
     "MULTIDRUG".to_string()
 }
 
+/// Builds gene database from PanRes entries.
 fn build_from_panres(panres_entries: &[PanResGeneEntry]) -> Result<(FxHashMap<String, String>, ArgMetaDb)> {
     eprintln!("[4] Building gene database from PanRes...");
 
@@ -1083,7 +1258,7 @@ fn build_from_panres(panres_entries: &[PanResGeneEntry]) -> Result<(FxHashMap<St
     let mut meta_genes: FxHashMap<String, GeneMeta> = FxHashMap::default();
 
     for entry in panres_entries {
-
+        // Use pan_id as gene_id to keep all sequences (PanRes already deduplicated)
         let gene_id = entry.pan_id.clone();
 
         let (chemical_class, atc_code) = get_chemical_and_atc(&entry.drug_class);
@@ -1109,6 +1284,7 @@ fn build_from_panres(panres_entries: &[PanResGeneEntry]) -> Result<(FxHashMap<St
     Ok((sequences, meta_db))
 }
 
+/// Fetches PanRes database files from Zenodo.
 fn fetch_panres_data(output_dir: &Path) -> Result<()> {
     let panres_dir = output_dir.join("panres_raw");
     std::fs::create_dir_all(&panres_dir)?;
@@ -1121,12 +1297,20 @@ fn fetch_panres_data(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Builds gene database from NCBI catalogue entries.
+///
+/// Uses protein accession as the key for matching catalogue entries to sequences.
+/// Both acquired ARGs and POINT mutations are processed uniformly - sequences are
+/// fetched by their accessions. POINT mutations use their own sequences directly;
+/// SNP verification happens later during genus classification (snp.rs).
+/// Downloads missing sequences from NCBI E-utilities when not found in AMR_CDS.fa.
 fn build_from_ncbi(
     catalogue: &FxHashMap<String, CatalogueEntry>,
     cds_sequences: &FxHashMap<String, String>,
 ) -> Result<(FxHashMap<String, String>, ArgMetaDb)> {
     eprintln!("[4] Building gene database from NCBI...");
 
+    // Separate nucleotide-only entries (keyed by "NUC:allele") from protein-based entries
     let mut gene_entries: FxHashMap<String, Vec<&CatalogueEntry>> = FxHashMap::default();
     let mut nuc_only_entries: Vec<(String, &CatalogueEntry)> = Vec::new();
     let mut point_count = 0;
@@ -1136,6 +1320,7 @@ fn build_from_ncbi(
             point_count += 1;
         }
 
+        // Nucleotide-only entries are keyed by "NUC:allele"
         if key.starts_with("NUC:") {
             nuc_only_entries.push((entry.allele.clone(), entry));
         } else {
@@ -1150,16 +1335,17 @@ fn build_from_ncbi(
 
     eprintln!("    {} unique gene IDs ({} POINT mutations) + {} nucleotide-only entries",
              gene_entries.len(), point_count, nuc_only_entries.len());
-
+    // Find sequences by protein accession
     let mut sequences: FxHashMap<String, String> = FxHashMap::default();
     let mut meta_genes: FxHashMap<String, GeneMeta> = FxHashMap::default();
     let mut missing_accessions: FxHashSet<String> = FxHashSet::default();
-
+    // Map accession to ALL gene_ids that use it (multiple POINT mutations can share same accession)
     let mut acc_to_genes: FxHashMap<String, Vec<String>> = FxHashMap::default();
 
     for (gene_id, gene_entries_list) in &gene_entries {
         let mut found_sequence: Option<String> = None;
 
+        // Try each protein accession in the entries
         for entry in gene_entries_list.iter() {
             if let Some(seq) = cds_sequences.get(&entry.protein_accession) {
                 found_sequence = Some(seq.clone());
@@ -1181,7 +1367,7 @@ fn build_from_ncbi(
             sequences.insert(gene_id.clone(), sequence);
             meta_genes.insert(gene_id.clone(), meta);
         } else {
-
+            // Mark for download - track ALL genes that use this accession
             if let Some(first_entry) = gene_entries_list.first() {
                 if !first_entry.protein_accession.is_empty() {
                     missing_accessions.insert(first_entry.protein_accession.clone());
@@ -1197,10 +1383,12 @@ fn build_from_ncbi(
              sequences.len(), missing_accessions.len(),
              acc_to_genes.values().map(|v| v.len()).sum::<usize>());
 
+    // Download missing protein-based sequences from NCBI
     if !missing_accessions.is_empty() {
         let acc_list: Vec<String> = missing_accessions.into_iter().collect();
         let downloaded = fetch_missing_cds(&acc_list)?;
 
+        // Apply downloaded sequence to ALL genes that share this accession
         for (acc, seq) in downloaded {
             if let Some(gene_ids) = acc_to_genes.get(&acc) {
                 for gene_id in gene_ids {
@@ -1226,9 +1414,11 @@ fn build_from_ncbi(
         eprintln!("    After protein download: {} total genes", sequences.len());
     }
 
+    // Fetch nucleotide-only sequences by coordinates (16S rRNA, etc.)
     if !nuc_only_entries.is_empty() {
         eprintln!("    Downloading nucleotide-only sequences...");
 
+        // Build coordinate fetch list: (gene_id, nuc_acc, start, stop, strand)
         let coord_fetch_list: Vec<(String, String, u64, u64, String)> = nuc_only_entries.iter()
             .filter_map(|(gene_id, entry)| {
                 if let (Some(nuc_acc), Some(start), Some(stop)) =
@@ -1241,9 +1431,11 @@ fn build_from_ncbi(
             })
             .collect();
 
+        // Fetch sequences
         let mut nuc_sequences: FxHashMap<String, String> = FxHashMap::default();
         fetch_by_coordinates(&coord_fetch_list, &mut nuc_sequences);
 
+        // Add fetched sequences to results
         for (gene_id, entry) in &nuc_only_entries {
             if let Some(seq) = nuc_sequences.get(gene_id) {
                 let (chemical_class, atc_code) = get_chemical_and_atc(&entry.ndaro_class);
@@ -1279,6 +1471,25 @@ fn build_from_ncbi(
     Ok((sequences, meta_db))
 }
 
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Builds the ARG reference database.
+///
+/// Downloads sequences from the specified source and creates:
+/// - AMR_{source}.fas: FASTA file for alignment (metadata in headers)
+/// - AMR_{source}.mmi: minimap2 index
+///
+/// # Arguments
+/// * `output_dir` - Directory for output files
+/// * `source` - Data source: "ncbi", "card", or "panres"
+/// * `_threads` - Thread count (reserved for future use)
+///
+/// # Sources
+/// - **ncbi**: NCBI AMRFinderPlus (recommended, curated gene names)
+/// - **card**: CARD database (includes CARD-only genes marked with '^')
+/// - **panres**: PanRes combined database from ARGprofiler (~14,000 genes)
 pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
     let source_suffix = match source {
         "ncbi" => "NCBI",
@@ -1289,16 +1500,19 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
 
     std::fs::create_dir_all(output_dir)?;
 
+    // Intermediate files (will be cleaned up)
     let catalogue_path = output_dir.join("ReferenceGeneCatalog.txt");
     let cds_path = output_dir.join("AMR_CDS.fa");
     let card_archive = output_dir.join("card-data.tar.bz2");
     let card_raw_dir = output_dir.join("card_raw");
 
+    // Intermediate file (will be deleted after indexing)
     let out_fasta = output_dir.join(format!("AMR_{}.fas", source_suffix));
-
+    // Output files with source suffix
     let out_mmi = output_dir.join(format!("AMR_{}.mmi", source_suffix));
     let out_tsv = output_dir.join(format!("AMR_{}.tsv", source_suffix));
 
+    // Check if already complete
     if out_mmi.exists() && out_tsv.exists() {
         let mmi_size = std::fs::metadata(&out_mmi)?.len();
         if mmi_size > 1_000_000 {
@@ -1308,6 +1522,7 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
         }
     }
 
+    // Build database based on source
     let (sequences, meta_db) = match source {
         "ncbi" => {
             eprintln!("\n[1] Downloading NCBI AMRFinderPlus database files...");
@@ -1363,6 +1578,7 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
         _ => unreachable!(),
     };
 
+    // Write output files
     eprintln!("\n[5] Writing output files...");
 
     let fasta_name = out_fasta.file_name().unwrap().to_str().unwrap();
@@ -1373,6 +1589,7 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
         let mut fasta_writer = BufWriter::new(File::create(&out_fasta)?);
         let mut tsv_writer = BufWriter::new(File::create(&out_tsv)?);
 
+        // TSV header
         writeln!(tsv_writer, "gene_name\tgene_family\tdrug_class\tchemical_class\tatc_code")?;
 
         let mut sorted_genes: Vec<_> = sequences.iter().collect();
@@ -1386,18 +1603,21 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
                     gene_id.clone()
                 };
 
+                // Write FASTA
                 writeln!(fasta_writer, ">{}|{}|{}|{}",
                         display_name, meta.drug_class, meta.chemical_class, meta.atc_code)?;
                 for chunk in sequence.as_bytes().chunks(80) {
                     writeln!(fasta_writer, "{}", std::str::from_utf8(chunk)?)?;
                 }
 
+                // Write TSV row
                 writeln!(tsv_writer, "{}\t{}\t{}\t{}\t{}",
                         display_name, meta.gene_family, meta.drug_class, meta.chemical_class, meta.atc_code)?;
             }
         }
     }
 
+    // Build minimap2 index
     eprintln!("\n[6] Building minimap2 index...");
     let mm2_result = Command::new("minimap2")
         .args(["-d", out_mmi.to_str().unwrap(), out_fasta.to_str().unwrap()])
@@ -1419,16 +1639,17 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
         }
     }
 
+    // Clean up intermediate files
     eprintln!("\n[7] Cleaning up intermediate files...");
     let mut cleaned = 0;
-
+    // Include FASTA in cleanup since we have the .mmi index
     let mmi_exists = out_mmi.exists();
     for path in [&catalogue_path, &cds_path, &card_archive] {
         if path.exists() && std::fs::remove_file(path).is_ok() {
             cleaned += 1;
         }
     }
-
+    // Only delete FASTA if mmi was successfully created
     if mmi_exists && out_fasta.exists() && std::fs::remove_file(&out_fasta).is_ok() {
         cleaned += 1;
     }
@@ -1443,6 +1664,7 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
         eprintln!("    Removed {} intermediate file(s)", cleaned);
     }
 
+    // Summary
     let mmi_size = std::fs::metadata(&out_mmi).map(|m| m.len()).unwrap_or(0);
     let tsv_size = std::fs::metadata(&out_tsv).map(|m| m.len()).unwrap_or(0);
 
@@ -1464,6 +1686,9 @@ pub fn build(output_dir: &Path, source: &str, _threads: usize) -> Result<()> {
     Ok(())
 }
 
+/// Builds flanking sequence database.
+///
+/// Delegates to flanking_db module for the actual implementation.
 pub fn build_flanking_db(
     output_dir: &Path,
     arg_db: &Path,
@@ -1474,6 +1699,20 @@ pub fn build_flanking_db(
     crate::flanking_db::build(output_dir, arg_db, threads, email, config)
 }
 
+/// Builds ARG database from a pre-built unified FASTA file.
+///
+/// This function takes an existing unified ARG database (e.g., created from
+/// ARO-normalized sequences from multiple sources) and creates:
+/// - AMR_unified.mmi: minimap2 index for alignment
+/// - AMR_unified.tsv: metadata file with gene annotations
+///
+/// Expected FASTA header format: >ARO_ID|gene_name|source|length
+/// Example: >ARO:3000005|vanD|CARD|1032
+///
+/// # Arguments
+/// * `output_dir` - Directory for output files
+/// * `unified_fasta` - Path to the pre-built unified ARG FASTA file
+/// * `_threads` - Thread count (reserved for future use)
 pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usize) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
@@ -1481,6 +1720,7 @@ pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usi
     let out_mmi = output_dir.join("AMR_unified.mmi");
     let out_tsv = output_dir.join("AMR_unified.tsv");
 
+    // Check if already complete
     if out_mmi.exists() && out_tsv.exists() {
         let mmi_size = std::fs::metadata(&out_mmi)?.len();
         if mmi_size > 1_000_000 {
@@ -1493,17 +1733,18 @@ pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usi
     eprintln!("\n[1] Reading unified ARG database...");
     eprintln!("    Input: {}", unified_fasta.display());
 
+    // Parse unified FASTA and convert to ARGenus format
     let file = File::open(unified_fasta)?;
     let reader = BufReader::new(file);
 
-    let mut sequences: Vec<(String, String, String, String, String)> = Vec::new();
+    let mut sequences: Vec<(String, String, String, String, String)> = Vec::new(); // (aro_id, gene_name, source, drug_class, sequence)
     let mut current_header: Option<(String, String, String)> = None;
     let mut current_seq = String::new();
 
     for line in reader.lines() {
         let line = line?;
         if line.starts_with('>') {
-
+            // Save previous sequence
             if let Some((aro_id, gene_name, source)) = current_header.take() {
                 if !current_seq.is_empty() {
                     let drug_class = infer_drug_class_from_gene(&gene_name, &gene_name);
@@ -1511,6 +1752,7 @@ pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usi
                 }
             }
 
+            // Parse header: >ARO_ID|gene_name|source|length
             let header = line.trim_start_matches('>');
             let parts: Vec<&str> = header.split('|').collect();
 
@@ -1525,6 +1767,7 @@ pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usi
         }
     }
 
+    // Save last sequence
     if let Some((aro_id, gene_name, source)) = current_header {
         if !current_seq.is_empty() {
             let drug_class = infer_drug_class_from_gene(&gene_name, &gene_name);
@@ -1534,6 +1777,7 @@ pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usi
 
     eprintln!("    Loaded {} sequences", sequences.len());
 
+    // Write output FASTA with ARGenus format
     eprintln!("\n[2] Writing output files...");
     {
         let mut fasta_writer = BufWriter::new(File::create(&out_fasta)?);
@@ -1544,15 +1788,19 @@ pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usi
         for (aro_id, gene_name, source, drug_class, sequence) in &sequences {
             let (chemical_class, atc_code) = get_chemical_and_atc(drug_class);
 
+            // Write FASTA: >gene_name|drug_class|chemical_class|atc_code
+            // Using gene_name as display ID for compatibility with existing detection pipeline
             writeln!(fasta_writer, ">{}|{}|{}|{}", gene_name, drug_class, chemical_class, atc_code)?;
             for chunk in sequence.as_bytes().chunks(80) {
                 writeln!(fasta_writer, "{}", std::str::from_utf8(chunk)?)?;
             }
 
+            // Write TSV
             writeln!(tsv_writer, "{}\t{}\t{}\t{}", aro_id, gene_name, source, drug_class)?;
         }
     }
 
+    // Build minimap2 index
     eprintln!("\n[3] Building minimap2 index...");
     let mm2_result = Command::new("minimap2")
         .args(["-d", out_mmi.to_str().unwrap(), out_fasta.to_str().unwrap()])
@@ -1573,11 +1821,13 @@ pub fn build_from_unified(output_dir: &Path, unified_fasta: &Path, _threads: usi
         }
     }
 
+    // Clean up intermediate FASTA if mmi was created successfully
     if out_mmi.exists() && out_fasta.exists() {
         let _ = std::fs::remove_file(&out_fasta);
         eprintln!("    Removed intermediate FASTA file");
     }
 
+    // Summary
     let mmi_size = std::fs::metadata(&out_mmi).map(|m| m.len()).unwrap_or(0);
     let tsv_size = std::fs::metadata(&out_tsv).map(|m| m.len()).unwrap_or(0);
 
