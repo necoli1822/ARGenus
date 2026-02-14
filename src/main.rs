@@ -67,7 +67,7 @@ ALIGNMENT TIE-BREAKING (for equal-score hits):
 
 OUTPUT FILES:
   results.tsv          Main output with detected ARGs and genus assignments
-    Columns: Sample, ARG_Name, ARG_Class, Genus, Confidence, Specificity,
+    Columns: Sample, Contig_ID, ARG_Name, ARG_Class, Genus, Confidence, Specificity,
              ARG_Identity, ARG_Coverage, Contig_Len, Upstream_Len,
              Downstream_Len, Extension_Method, Top_Matches
 
@@ -326,6 +326,7 @@ struct Sample {
 #[derive(Debug, Clone)]
 struct ResultRow {
     sample: String,
+    contig_id: String,
     arg_name: String,
     arg_class: String,
     genus: String,
@@ -1209,6 +1210,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
 
             ResultRow {
                 sample: sample.name.clone(),
+                contig_id: hit.contig.clone(),
                 arg_name: hit.arg_name.clone(),
                 arg_class: hit.arg_class.clone(),
                 genus: genus_info.genus.unwrap_or_else(|| "Unknown".to_string()),
@@ -1314,7 +1316,7 @@ fn classify_genera(
 }
 
 fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
-    let header = "Sample\tARG_Name\tARG_Class\tGenus\tConfidence\tSpecificity\tARG_Identity\tARG_Coverage\tContig_Len\tUpstream_Len\tDownstream_Len\tExtension_Method\tSNP_Status\tTop_Matches";
+    let header = "Sample\tContig_ID\tARG_Name\tARG_Class\tGenus\tConfidence\tSpecificity\tARG_Identity\tARG_Coverage\tContig_Len\tUpstream_Len\tDownstream_Len\tExtension_Method\tSNP_Status\tTop_Matches";
 
     // By default, filter out WildType and NotCovered (not true resistance genes)
     // WildType: SNP position checked but found wild-type allele (no resistance mutation)
@@ -1339,8 +1341,9 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
     for r in &output_results {
         writeln!(
             output,
-            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
             r.sample,
+            r.contig_id,
             r.arg_name,
             r.arg_class,
             r.genus,
