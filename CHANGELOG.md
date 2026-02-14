@@ -2,6 +2,19 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.2.1] - 2026-02-14
+
+### Added
+
+- **Contig_ID column**: New `Contig_ID` column in output TSV after `Sample` column
+  - Links each ARG detection to its source contig (e.g., contig_1, contig_2)
+  - Enables tracing ARG variants back to assembled contigs
+
+### Changed
+
+- **Package naming**: Standardized to `ARGenus` (capital ARG) across all configurations
+- **Documentation**: Updated README with Contig_ID in Output Format table
+
 ## [0.2.0] - 2026-02-13
 
 ### Added

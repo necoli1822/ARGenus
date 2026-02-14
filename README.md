@@ -138,6 +138,7 @@ ARGenus produces a tab-delimited file with the following columns:
 | Column | Description |
 |--------|-------------|
 | sample | Sample identifier |
+| contig_id | Contig identifier (e.g., contig_1) |
 | gene | ARG gene name |
 | drug_class | Antimicrobial drug class |
 | genus | Assigned source genus |
