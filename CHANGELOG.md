@@ -2,6 +2,12 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.2.3] - 2026-07-05
+
+### Fixed
+
+- **Dependencies**: Updated the transitive `lz4_flex` lockfile entry from the yanked 0.11.5 to 0.11.6 (no source changes).
+
 ## [0.2.2] - 2026-07-05
 
 ### Fixed
