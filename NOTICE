@@ -5,10 +5,9 @@ The ARGenus SOURCE CODE is licensed under the MIT License (see LICENSE).
 This notice concerns the PRE-BUILT DATABASES only.
 
 The pre-built databases distributed as GitHub Release / Zenodo assets
-(argenus-db-*.tar.gz, containing AMR_PanRes.mmi, PanRes_genes_v1.0.0.fa,
-flanking.fdb, plasmid_contigs.txt, contig_species.tsv, and any files derived
-from them) are DERIVED FROM the PanRes resistance-gene database and are therefore
-licensed under:
+(argenus-db-*.tar.gz, containing PanRes_genes_v1.0.0.fa, flanking_1kbp.fdb,
+plasmid_contigs.txt, contig_species.tsv, and any files derived from them) are
+DERIVED FROM the PanRes resistance-gene database and are therefore licensed under:
 
     Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
     https://creativecommons.org/licenses/by-nc/4.0/
@@ -40,8 +39,7 @@ their respective terms of use:
 Modifications made by ARGenus
 -----------------------------
 The distributed database was produced FROM PanRes by:
-  - indexing the PanRes gene sequences with minimap2 (AMR_PanRes.mmi);
-  - building a flanking-sequence database (flanking.fdb) that pairs PanRes gene
+  - building a flanking-sequence database (flanking_1kbp.fdb) that pairs PanRes gene
     identifiers with genomic flanking regions drawn from public sequence sources
     (e.g. GenBank / PLSDB);
   - adding auxiliary files (plasmid_contigs.txt, contig_species.tsv).

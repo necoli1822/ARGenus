@@ -2,6 +2,15 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.3.1] - 2026-07-12
+
+### Changed
+
+- **`--db-dir` flanking-DB discovery**: when a database folder contains more than one
+  `*.fdb` file (e.g. both `flanking_1kbp.fdb` and `flanking_5kbp.fdb`), ARGenus now
+  errors and asks you to choose one with `-f/--flanking-db`, instead of silently
+  picking the alphabetically-first file.
+
 ## [0.3.0] - 2026-07-12
 
 ### Added

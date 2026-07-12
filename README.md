@@ -11,6 +11,13 @@ the gene on the assembled contig. Unlike tools that only detect ARGs, ARGenus li
 each ARG to a genus (and, when the flanking is specific enough, a species) and tells
 you how much to trust that link.
 
+## What's new in 0.3.1
+
+- **`--db-dir` picks one flanking DB unambiguously.** If a database folder holds more
+  than one `.fdb` (e.g. both the 1 kbp and 5 kbp resolutions), ARGenus now stops and
+  asks you to choose one with `-f/--flanking-db`, instead of silently loading the
+  alphabetically-first file.
+
 ## What's new in 0.3.0
 
 ARGs frequently sit on **plasmids and other mobile elements** that move between
@@ -76,7 +83,7 @@ Only for opt-in features — **not** needed for a standard run:
 
 ## Databases
 
-ARGenus needs an **ARG reference** (`.mmi` or FASTA) and a **flanking database**
+ARGenus needs an **ARG reference** (a FASTA) and a **flanking database**
 (`.fdb`). These are **not** shipped with the crate (too large) — download the
 pre-built set or build your own.
 
@@ -86,7 +93,7 @@ The **1,000 bp** PanRes database is published as a GitHub Release asset. Downloa
 extract, and point ARGenus at the folder with `-d`:
 
 ```bash
-# 311 MB download, ~360 MB extracted into ./db/
+# 297 MB download, ~312 MB extracted into ./db/
 curl -L -o argenus-db-1kbp-v0.3.0.tar.gz \
   https://github.com/necoli1822/ARGenus/releases/download/db-1kbp-v0.3.0/argenus-db-1kbp-v0.3.0.tar.gz
 tar xzf argenus-db-1kbp-v0.3.0.tar.gz       # -> db/
@@ -101,16 +108,15 @@ ARGenus ships two flanking-DB resolutions:
 - **5,000 bp** (species-level, higher resolution) — much larger (~9 GB), archived on
   **Zenodo**: <https://doi.org/10.5281/zenodo.21321983> (CC BY-NC 4.0).
 
-**Picking a resolution.** `-d` auto-discovery uses a file named exactly `flanking.fdb`
-if one exists, otherwise the **alphabetically-first `*.fdb`** in the folder (no
-warning). So when more than one `.fdb` shares a folder — e.g. both resolutions — the
-auto-pick may not be the one you want. Select the resolution **explicitly with `-f`**:
+**Picking a resolution.** With `-d`, ARGenus loads the single `.fdb` it finds in the
+folder. If the folder holds more than one — e.g. both resolutions — it stops and asks
+you to choose one **explicitly with `-f`**:
 
 ```bash
 # 1,000 bp (genus-level)
-argenus -f flanking_panres_1kbp.fdb -a db/AMR_PanRes.mmi -1 R1.fq.gz -2 R2.fq.gz -o results/
+argenus -f flanking_1kbp.fdb -a db/PanRes_genes_v1.0.0.fa -1 R1.fq.gz -2 R2.fq.gz -o results/
 # 5,000 bp (species-level)
-argenus -f flanking_5kbp.fdb        -a db/AMR_PanRes.mmi -1 R1.fq.gz -2 R2.fq.gz -o results/
+argenus -f flanking_5kbp.fdb -a db/PanRes_genes_v1.0.0.fa -1 R1.fq.gz -2 R2.fq.gz -o results/
 ```
 
 You can also build either database yourself (see below).
@@ -125,15 +131,21 @@ The bundle contains:
 
 | File | Size | Role |
 |------|------|------|
-| `AMR_PanRes.mmi` | 33 MB | ARG reference — minimap2 index |
-| `PanRes_genes_v1.0.0.fa` | 13 MB | ARG reference — FASTA (for `--mapper strobealign`/`bwa-mem2`) |
-| `flanking.fdb` | 293 MB | Flanking database (**required**) |
+| `PanRes_genes_v1.0.0.fa` | 13 MB | ARG reference (FASTA) |
+| `flanking_1kbp.fdb` | 293 MB | Flanking database (**required**) |
 | `plasmid_contigs.txt` | 372 KB | Context axis (plasmid/chromosome) |
 | `contig_species.tsv` | 6.9 MB | Species axis |
 
 `-d/--db-dir` auto-discovers the ARG reference, the flanking `.fdb`, and the optional
 `plasmid_contigs.txt` / `contig_species.tsv` inside the folder. Explicit
 `-a/-f/--plasmid-contigs/--species-map` still override what's found there.
+
+> **ARG reference format.** The reference ships as a **FASTA**, which every aligner can
+> use: ARGenus indexes it for minimap2 on the fly (the correct `-x asm20` / `-x sr`
+> preset per step) and lets strobealign / bwa-mem2 build their own index. You may pass a
+> prebuilt minimap2 `.mmi` to `-a` for a small speed-up, but it must be built with
+> ARGenus's presets or minimap2 will override them — so the FASTA is the recommended,
+> foolproof choice.
 
 ### Build your own
 
@@ -142,10 +154,10 @@ The bundle contains:
 argenus -b arg -x panres -o databases/
 
 # Build a 1,000 bp flanking DB (GenBank/PLSDB)
-argenus -b flank --mode short -a databases/AMR_PanRes.mmi -o databases/ -e you@email.com
+argenus -b flank --mode short -a databases/PanRes_genes_v1.0.0.fa -o databases/ -e you@email.com
 
 # Compress an existing flanking TSV to FDB (external-sort build)
-argenus -b fdb -a flanking.tsv -o databases/flanking.fdb
+argenus -b fdb -a flanking.tsv -o databases/flanking_1kbp.fdb
 ```
 
 The two side files (`plasmid_contigs.txt`, `contig_species.tsv`) are auto-loaded from
@@ -160,8 +172,8 @@ argenus -d db/ -1 R1.fq.gz -2 R2.fq.gz -o results/
 
 # ...or point at each database file explicitly
 argenus -1 R1.fq.gz -2 R2.fq.gz \
-    -a databases/AMR_PanRes.mmi \
-    -f databases/flanking.fdb \
+    -a databases/PanRes_genes_v1.0.0.fa \
+    -f databases/flanking_1kbp.fdb \
     -o results/
 
 # Batch: a directory (auto-detect *_R[12].fastq.gz) or an ID-list file
@@ -266,4 +278,5 @@ Bioinformatics 40(3):btae086 (2024). https://doi.org/10.1093/bioinformatics/btae
 
 ## Contact
 
+Created and maintained by **Sunju Kim** ([ORCID 0000-0002-2384-2425](https://orcid.org/0000-0002-2384-2425)).
 Questions and bug reports: open an issue at https://github.com/necoli1822/ARGenus

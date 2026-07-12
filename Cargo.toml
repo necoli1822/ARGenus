@@ -1,6 +1,6 @@
 [package]
 name = "ARGenus"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "ARG detection and genus-level classification using flanking sequence analysis"
 authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]

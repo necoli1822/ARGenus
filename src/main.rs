@@ -998,7 +998,7 @@ fn main() -> Result<()> {
                 .or_else(|| find_fasta_file(&dir));
         }
         if args.flanking_db.is_none() {
-            args.flanking_db = find_flanking_db(&dir);
+            args.flanking_db = find_flanking_db(&dir)?;
         }
         if args.ref_fasta.is_none() {
             args.ref_fasta = find_fasta_file(&dir);
@@ -2121,16 +2121,37 @@ fn find_db_file(dir: &Path, exts: &[&str]) -> Option<PathBuf> {
 
 /// Locate the flanking DB in `dir`: a `flanking.fdb` file, any `*.fdb` file, or a
 /// `*.fdb/` directory containing `flanking.fdb`.
-fn find_flanking_db(dir: &Path) -> Option<PathBuf> {
-    let direct = dir.join("flanking.fdb");
-    if direct.is_file() {
-        return Some(direct);
+/// Locate the flanking DB in `dir`.
+///
+/// Returns `Ok(Some(path))` for a single unambiguous match, `Ok(None)` when nothing
+/// is found, or `Err` when several `*.fdb` files are present — the user must then pick
+/// one with `-f/--flanking-db` rather than have ARGenus silently guess (e.g. a folder
+/// holding both `flanking_1kbp.fdb` and `flanking_5kbp.fdb`).
+fn find_flanking_db(dir: &Path) -> Result<Option<PathBuf>> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .filter(|p| p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("fdb"))
+            .unwrap_or(false))
+        .collect();
+    files.sort();
+    if files.len() == 1 {
+        return Ok(Some(files.pop().unwrap()));
     }
-    if let Some(f) = find_db_file(dir, &["fdb"]) {
-        return Some(f);
+    if files.len() > 1 {
+        let names: Vec<String> = files.iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(String::from))
+            .collect();
+        anyhow::bail!(
+            "found {} flanking databases in {} ({}); \
+             pass the one you want explicitly with -f/--flanking-db",
+            files.len(), dir.display(), names.join(", ")
+        );
     }
-    // A `*.fdb/` directory (the builder's layout) with flanking.fdb inside.
-    let mut subdirs: Vec<PathBuf> = fs::read_dir(dir).ok()?
+    // No `*.fdb` file — try the builder's `*.fdb/` directory layout.
+    let mut subdirs: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.is_dir() && p.extension().and_then(|e| e.to_str()) == Some("fdb"))
         .collect();
@@ -2138,10 +2159,10 @@ fn find_flanking_db(dir: &Path) -> Option<PathBuf> {
     for sd in subdirs {
         let inner = sd.join("flanking.fdb");
         if inner.is_file() {
-            return Some(inner);
+            return Ok(Some(inner));
         }
     }
-    None
+    Ok(None)
 }
 
 /// True if `p` names a FASTA (optionally gzip-compressed): *.fa/.fas/.fasta/.fna,
