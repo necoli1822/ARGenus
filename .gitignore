@@ -3,8 +3,9 @@
 **/*.rs.bk
 Cargo.lock
 
-# Databases (large files - download separately)
+# Databases (large files - download separately, distributed via GitHub Release)
 /databases/
+/db/
 *.fdb
 *.mmi
 
@@ -16,9 +17,6 @@ Cargo.lock
 
 # Archives
 /archives/
-
-# Internal working directory
-/.omc/
 
 # PDFs and documents
 *.pdf

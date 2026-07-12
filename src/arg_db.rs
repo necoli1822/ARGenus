@@ -1057,8 +1057,6 @@ fn build_from_card(card_entries: &[CardGeneEntry]) -> Result<(FxHashMap<String, 
 #[derive(Clone, Debug)]
 struct PanResGeneEntry {
     pan_id: String,
-    #[allow(dead_code)] // retained for data-model completeness / debugging
-    gene_name: String,
     gene_family: String,
     drug_class: String,
     sequence: String,
@@ -1125,14 +1123,13 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
                 // Save previous entry
                 if let Some(pan_id) = current_id.take() {
                     if !current_seq.is_empty() {
-                        let (gene_name, gene_family, drug_class) = metadata
+                        let (_gene_name, gene_family, drug_class) = metadata
                             .get(&pan_id)
                             .cloned()
                             .unwrap_or_else(|| (pan_id.clone(), pan_id.clone(), "MULTIDRUG".to_string()));
 
                         entries.push(PanResGeneEntry {
                             pan_id: pan_id.clone(),
-                            gene_name,
                             gene_family,
                             drug_class,
                             sequence: std::mem::take(&mut current_seq),
@@ -1152,14 +1149,13 @@ fn parse_panres_entries(panres_dir: &Path) -> Result<Vec<PanResGeneEntry>> {
         // Save last entry
         if let Some(pan_id) = current_id {
             if !current_seq.is_empty() {
-                let (gene_name, gene_family, drug_class) = metadata
+                let (_gene_name, gene_family, drug_class) = metadata
                     .get(&pan_id)
                     .cloned()
                     .unwrap_or_else(|| (pan_id.clone(), pan_id.clone(), "MULTIDRUG".to_string()));
 
                 entries.push(PanResGeneEntry {
                     pan_id,
-                    gene_name,
                     gene_family,
                     drug_class,
                     sequence: current_seq,

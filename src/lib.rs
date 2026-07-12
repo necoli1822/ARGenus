@@ -23,3 +23,4 @@ pub mod arg_db;
 pub mod flanking_db;
 pub mod fdb;
 pub mod flanking_db_ntprok;
+pub mod reassemble;

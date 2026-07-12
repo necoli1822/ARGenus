@@ -1,21 +1,51 @@
 # ARGenus
 
-**ARG detection and genus-level classification using flanking sequence analysis**
+**ARG detection with honest genus / species / replicon-context reporting from metagenomes**
 
 [![Crates.io](https://img.shields.io/crates/v/argenus.svg)](https://crates.io/crates/argenus)
 [![License](https://img.shields.io/crates/l/argenus.svg)](LICENSE)
 
-ARGenus is a bioinformatics tool that simultaneously detects antibiotic resistance genes (ARGs) and identifies their source bacterial genera from metagenomic sequencing data. Unlike existing tools that only detect ARGs, ARGenus provides direct ARG-to-genus linkage through flanking sequence analysis.
+ARGenus detects antibiotic resistance genes (ARGs) in metagenomic reads and, for each
+ARG, reports the bacterial **source** it was found in — using the DNA that *flanks*
+the gene on the assembled contig. Unlike tools that only detect ARGs, ARGenus links
+each ARG to a genus (and, when the flanking is specific enough, a species) and tells
+you how much to trust that link.
+
+## What's new in 0.3.0
+
+ARGs frequently sit on **plasmids and other mobile elements** that move between
+genera, so forcing a single "source genus" is often wrong. 0.3.0 replaces the single
+genus call with an **honest 4-axis report** so an ambiguous locus looks ambiguous
+instead of confidently wrong:
+
+- **Genus** — a single genus, or `multi-genus(N):A/B/C/…` when several genera share
+  the flanking within a small identity margin (a promiscuous gene), or `Unknown`.
+- **Species** — a stricter, separately-thresholded call (`--species-identity`);
+  `multi-species(N):…` / `Unknown` when the flanking isn't near-identical.
+- **Context** — replicon of the matched flanking: `plasmid` / `chromosome` /
+  `ambiguous` / `NA`, derived from PLSDB provenance of the flanking references.
+  `chromosome` + single-genus is trustworthy; `plasmid` + multi-genus is not.
+- **Specificity** — how gene-specific (breadth) the flanking evidence is.
+
+Also new:
+- **Per-locus reassembly** (`--reassemble`, opt-in): core/flank read split + SPAdes
+  to recover a classifiable flanking for stalled loci.
+- **Per-locus exports** (`--emit-*`): write gene / flanking sequences (assembled or
+  as reads) for the resolved / no-flank-match / gene-not-in-DB classes.
+- **Pluggable read filter** (`--mapper strobealign|minimap2|bwa-mem2`).
+- **Contig-only mode** (`--classify-contigs`) to classify a pre-assembled FASTA.
+- **Bounded-memory extension** — extension consensus is accumulated as per-position
+  base counts, and each contig end is capped (`--max-extension`), so runtime and RAM
+  no longer blow up on high-coverage/repetitive loci.
 
 ## Features
 
-- **Direct ARG-genus linkage**: Identifies the bacterial source of each detected ARG
-- **Targeted assembly**: Efficient processing through read filtering and localized assembly
-- **SNP verification**: Filters false positives by confirming resistance-conferring mutations
-- **Dual database modes**: 1,000 bp (high coverage) and 5,000 bp (high resolution) flanking databases
-- **High compression**: Custom FDB format with ~22x compression ratio
-- **Memory-efficient**: Streaming FDB builder for large datasets (works with 8-16 GB RAM)
-- **Fast processing**: 5-10 minutes per sample with 16 threads
+- **Direct ARG→genus/species linkage** through flanking sequence analysis
+- **Honest reporting**: multi-genus / multi-species / replicon context, not a forced call
+- **Targeted assembly**: read filtering → MEGAHIT → k-mer extension (optional SPAdes reassembly)
+- **SNP verification**: confirms resistance-conferring mutations for point-mutation ARGs
+- **Compact database**: custom FDB format (zstd-compressed, on-demand gene blocks)
+- **Scales with depth**: bounded extension memory; multi-threaded
 
 ## Installation
 
@@ -28,171 +58,180 @@ cargo install argenus
 ### From source
 
 ```bash
-git clone https://github.com/necoli1822/argenus.git
-cd argenus
+git clone https://github.com/necoli1822/ARGenus.git
+cd ARGenus
 cargo build --release
 ```
 
-### Dependencies
+### External tools (must be on `PATH`)
 
-ARGenus requires the following tools in your PATH:
-- [minimap2](https://github.com/lh3/minimap2) - sequence alignment
-- [MEGAHIT](https://github.com/voutcn/megahit) - metagenomic assembly
+Required to run ARGenus on reads:
+- [minimap2](https://github.com/lh3/minimap2) — alignment for ARG detection **and** flanking classification (always used)
+- [MEGAHIT](https://github.com/voutcn/megahit) — assembly of the filtered reads
+- [strobealign](https://github.com/ksahlin/strobealign) — the **default** read filter; not needed if you run `--mapper minimap2`
 
-For building the 5,000 bp flanking database:
-- [BLAST+](https://blast.ncbi.nlm.nih.gov/doc/blast-help/downloadblastdata.html) - blastn and blastdbcmd
+Only for opt-in features — **not** needed for a standard run:
+- [SPAdes](https://github.com/ablab/spades) — only for `--reassemble`
+- [BLAST+](https://blast.ncbi.nlm.nih.gov/) (`blastn`, `blastdbcmd`) — only to *build* the 5,000 bp (`--mode long`) flanking DB; never used at run time, and unnecessary with the pre-built database below
 
-## Database Setup
+## Databases
 
-ARGenus requires a flanking sequence database for genus classification.
+ARGenus needs an **ARG reference** (`.mmi` or FASTA) and a **flanking database**
+(`.fdb`). These are **not** shipped with the crate (too large) — download the
+pre-built set or build your own.
 
-### Pre-built Databases
+### Download the pre-built database (recommended)
 
-| Database | Size | Coverage | Genus Resolution | Best For |
-|----------|------|----------|------------------|----------|
-| flanking_1kbp.fdb | ~50 MB | 97.6% | 83.9% | High-throughput screening |
-| flanking_5kbp.fdb | ~8.7 GB | 91.5% | 92.8% | Epidemiological studies |
-
-### Building Flanking Database
-
-#### Short mode (1,000 bp) - from GenBank/PLSDB
+The **1,000 bp** PanRes database is published as a GitHub Release asset. Download,
+extract, and point ARGenus at the folder with `-d`:
 
 ```bash
-argenus -b fdb -m short -o databases/flanking_1kbp.fdb
+# 311 MB download, ~360 MB extracted into ./db/
+curl -L -o argenus-db-1kbp-v0.3.0.tar.gz \
+  https://github.com/necoli1822/ARGenus/releases/download/db-1kbp-v0.3.0/argenus-db-1kbp-v0.3.0.tar.gz
+tar xzf argenus-db-1kbp-v0.3.0.tar.gz       # -> db/
+
+# -d auto-discovers everything inside the folder
+argenus -d db/ -1 R1.fq.gz -2 R2.fq.gz -o results/
 ```
 
-#### Long mode (5,000 bp) - from NCBI nt_prok
+ARGenus ships two flanking-DB resolutions. Only the **1,000 bp** database (high
+coverage, genus-level) is distributed for now; the **5,000 bp** database (higher,
+species-level resolution) is much larger and will be released separately once its
+size is reduced. Until then you can build the 5,000 bp DB yourself (see below).
+
+The bundle contains:
+
+| File | Size | Role |
+|------|------|------|
+| `AMR_PanRes.mmi` | 33 MB | ARG reference — minimap2 index |
+| `PanRes_genes_v1.0.0.fa` | 13 MB | ARG reference — FASTA (for `--mapper strobealign`/`bwa-mem2`) |
+| `flanking.fdb` | 293 MB | Flanking database (**required**) |
+| `plasmid_contigs.txt` | 372 KB | Context axis (plasmid/chromosome) |
+| `contig_species.tsv` | 6.9 MB | Species axis |
+
+`-d/--db-dir` auto-discovers the ARG reference, the flanking `.fdb`, and the optional
+`plasmid_contigs.txt` / `contig_species.tsv` inside the folder. Explicit
+`-a/-f/--plasmid-contigs/--species-map` still override what's found there.
+
+### Build your own
 
 ```bash
-argenus -b fdb -m long \
-    -o databases/flanking_5kbp.fdb \
-    --blastn /path/to/blastn \
-    --blastdbcmd /path/to/blastdbcmd \
-    --nt-prok /path/to/nt_prok \
-    --taxdump ./taxonomy
+# Build the ARG reference (e.g. from PanRes)
+argenus -b arg -x panres -o databases/
+
+# Build a 1,000 bp flanking DB (GenBank/PLSDB)
+argenus -b flank --mode short -a databases/AMR_PanRes.mmi -o databases/ -e you@email.com
+
+# Compress an existing flanking TSV to FDB (external-sort build)
+argenus -b fdb -a flanking.tsv -o databases/flanking.fdb
 ```
 
-#### Streaming mode (for large datasets)
-
-For datasets exceeding available RAM, use the streaming mode with external sorting:
-
-```bash
-# Step 1: External sort
-sort -t'\t' -k1,1 -S 8G --parallel=8 flanking.tsv > flanking_sorted.tsv
-
-# Step 2: Streaming FDB build
-argenus -b fdb --sorted -i flanking_sorted.tsv -o flanking.fdb
-```
+The two side files (`plasmid_contigs.txt`, `contig_species.tsv`) are auto-loaded from
+beside the `.fdb` if present, and enable the Context and Species axes respectively. You
+can also pass them explicitly with `--plasmid-contigs` / `--species-map`.
 
 ## Usage
 
-### Basic usage
-
 ```bash
-argenus run \
-    --r1 sample_R1.fastq.gz \
-    --r2 sample_R2.fastq.gz \
-    --db databases/AMR_PanRes.mmi \
-    --fdb databases/flanking_1kbp.fdb \
-    --output results/sample_argenus.tsv
+# Single sample (with a database folder — see Databases below)
+argenus -d db/ -1 R1.fq.gz -2 R2.fq.gz -o results/
+
+# ...or point at each database file explicitly
+argenus -1 R1.fq.gz -2 R2.fq.gz \
+    -a databases/AMR_PanRes.mmi \
+    -f databases/flanking.fdb \
+    -o results/
+
+# Batch: a directory (auto-detect *_R[12].fastq.gz) or an ID-list file
+argenus -l fastq_dir/ -d db/ -o results/
 ```
 
-### Options
+Results are written to `results/results.tsv`.
 
-```
-argenus run [OPTIONS]
+### Common options
 
-Required:
-    --r1 <FILE>         Forward reads (FASTQ/FASTQ.gz)
-    --r2 <FILE>         Reverse reads (FASTQ/FASTQ.gz)
-    --db <FILE>         ARG database index (.mmi)
-    --fdb <FILE>        Flanking sequence database (.fdb)
-    --output <FILE>     Output TSV file
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-1, -2 <FILE>` | — | Paired FASTQ(.gz); comma-separated for multiple samples |
+| `-l, --samples <PATH>` | — | Batch: ID-list file or directory of FASTQs |
+| `-a, --arg-db <FILE>` | — | ARG reference (`.mmi` or FASTA) |
+| `-f, --flanking-db <FILE>` | — | Flanking database (`.fdb`) |
+| `-d, --db-dir <DIR>` | — | Auto-discover ARG ref + flanking `.fdb` (+ side files) in one folder |
+| `-o, --outdir <DIR>` | `.` | Output directory |
+| `-t, --threads <N>` | auto | Total threads |
+| `--mapper <TOOL>` | `strobealign` | Read filter: `strobealign` / `minimap2` / `bwa-mem2` |
+| `--ref-fasta <FILE>` | derived | FASTA reference for strobealign/bwa-mem2 |
+| `-i, --arg-identity <F>` | `0.80` | Min identity for ARG detection |
+| `-c, --arg-coverage <F>` | `0.70` | Min coverage for ARG detection |
+| `-n, --max-flanking <BP>` | `1000` | Flanking length used for classification |
+| `-u, --keep-temp` | off | Keep per-sample intermediates |
+| `-v, --verbose` | off | Progress to stderr |
 
-Optional:
-    --threads <N>       Number of threads [default: 16]
-    --min-identity <F>  Minimum identity for ARG matching [default: 0.8]
-    --min-coverage <F>  Minimum coverage for ARG matching [default: 0.7]
-    --flank-identity <F> Minimum identity for genus classification [default: 0.9]
-    --include-wildtype  Include wild-type alleles in output
-```
+### Honest-reporting options
 
-### Flanking Database Building Options
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--genus-identity <F>` | `0.90` | Min flanking identity to separate genera |
+| `--species-identity <F>` | `0.96` | Min flanking identity to call species (0 disables) |
+| `--context-plasmid-frac <F>` | `0.5` | Plasmid-fraction ≥ this → Context `plasmid` |
+| `--context-chromosome-frac <F>` | `0.1` | Plasmid-fraction ≤ this → Context `chromosome` |
+| `--plasmid-contigs <FILE>` | auto | Plasmid accessions for the Context axis |
+| `--species-map <FILE>` | auto | `contig<TAB>species` for the Species axis |
 
-```
-argenus -b fdb [OPTIONS]
+### Assembly / reassembly / exports
 
-Options:
-    -m, --mode <MODE>      Database mode: short (1000bp) or long (5000bp)
-    -o, --output <PATH>    Output FDB path
-    --sorted               Input TSV is pre-sorted by gene name (streaming mode)
-    --taxdump <PATH>       Path to NCBI taxdump directory
-    --threads <N>          Number of threads [default: available CPUs]
-    --buffer-mb <MB>       Sort buffer size in MB [default: 1024]
-```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--max-extension <BP>` | `0` (=2×max-flanking) | Cap bp added to each contig end (stops runaway extension; no effect on classification) |
+| `--reassemble` | off | Per-locus core/flank reassembly (SPAdes) for stalled loci |
+| `--spades-path <FILE>` | `spades.py` | SPAdes for `--reassemble` |
+| `--reassemble-jobs <N>` | `4` | Concurrent SPAdes jobs |
+| `--classify-contigs <FASTA>` | — | Classify a pre-assembled contig FASTA (skip read pipeline) |
+| `--emit-class/-part/-state <LIST>` | — | Per-locus FASTA exports (opt-in) |
 
-## Output Format
+Run `argenus --help` for the complete list.
 
-ARGenus produces a tab-delimited file with the following columns:
+## Output format (`results.tsv`)
+
+Tab-delimited, one row per ARG locus:
 
 | Column | Description |
 |--------|-------------|
-| sample | Sample identifier |
-| contig_id | Contig identifier (e.g., contig_1) |
-| gene | ARG gene name |
-| drug_class | Antimicrobial drug class |
-| genus | Assigned source genus |
-| confidence | Classification confidence (mean identity) |
-| specificity | Gene-genus association strength |
-| identity | ARG sequence identity |
-| coverage | ARG sequence coverage |
-| contig_length | Assembled contig length |
-| upstream_len | Upstream flanking sequence length |
-| downstream_len | Downstream flanking sequence length |
-| extension_method | Extension method used (strict/flexible) |
-| snp_status | SNP verification status |
+| Sample | Sample identifier |
+| Contig_ID | Contig identifier |
+| ARG_Name | ARG gene name |
+| ARG_Class | Antimicrobial class |
+| **Genus** | Source genus, or `multi-genus(N):…`, or `Unknown` |
+| **Species** | Source species, or `multi-species(N):…`, or `Unknown` |
+| Confidence | Mean flanking identity of the call |
+| Specificity | Gene-specificity (breadth) of the flanking evidence |
+| **Context** | `plasmid` / `chromosome` / `ambiguous` / `NA` |
+| ARG_Identity | ARG sequence identity |
+| ARG_Coverage | ARG sequence coverage |
+| Contig_Len | Assembled contig length |
+| Upstream_Len | Upstream flanking length |
+| Downstream_Len | Downstream flanking length |
+| Extension_Method | `strict` / `flexible` / `reassemble` |
+| SNP_Status | SNP verification status (point-mutation ARGs) |
+| Top_Matches | Top genus candidates with scores |
 
-## Performance
-
-- **Processing speed**: 5-10 minutes per sample (10-20M reads, 16 threads)
-- **Memory usage**: ~700 MB for FDB building (streaming mode)
-- **Classification rate**: ~73% genus-level assignment
-- **False positive rate**: <5% (compared to 15% for KMA)
-
-## Database Statistics
-
-### Flanking Database (v3)
-
-| Metric | 1,000 bp | 5,000 bp |
-|--------|----------|----------|
-| File size | ~50 MB | ~8.7 GB |
-| Total records | 1,069,848 | 23,184,244 |
-| Gene count | 11,835 | 11,092 |
-| Gene coverage | 97.6% | 91.5% |
-| Genus resolution | 83.9% | 92.8% |
-| Species resolution | 74.7% | 85.2% |
-
-### Data Sources
-
-| Database | Records |
-|----------|---------|
-| NCBI nt_prok | 8,722,761 sequences |
-| GenBank prokaryotic | 85,269 genomes |
-| PLSDB | 14,635 plasmids |
-| PanRes | 13,280 ARGs |
+**Reading it:** `chromosome` + single Genus + single Species = trustworthy.
+`multi-genus(N)` and/or `plasmid` = a promiscuous / mobile gene — the genus is not a
+reliable single source.
 
 ## Citation
 
-If you use ARGenus in your research, please cite:
+If you use ARGenus, please cite:
 
 ```
-[Citation information to be added upon publication]
+[Citation to be added upon publication]
 ```
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE).
 
 ## Contact
 
-For questions and bug reports, please open an issue on GitHub.
+Questions and bug reports: open an issue at https://github.com/necoli1822/ARGenus

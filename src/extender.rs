@@ -62,6 +62,12 @@ pub struct ExtenderConfig {
     pub extension_step: usize,
     /// Maximum consecutive failures before stopping (default: 2).
     pub max_consecutive_failures: usize,
+    /// Cap on total bp added to EACH contig end (default: 2000). Genus/species
+    /// classification only uses ~max_flanking (1000 bp) of flanking, so extending a
+    /// runaway (repetitive/high-coverage) contig for many more rounds is wasted work
+    /// — and re-scanning all reads each round is the dominant runtime. Capping each
+    /// side stops runaways early without affecting classification.
+    pub max_extension_per_side: usize,
 }
 
 impl Default for ExtenderConfig {
@@ -74,6 +80,7 @@ impl Default for ExtenderConfig {
             max_n_ratio: 0.05,
             extension_step: 200,
             max_consecutive_failures: 2,
+            max_extension_per_side: 2000,
         }
     }
 }
@@ -101,7 +108,9 @@ pub struct ExtendedContig {
 /// Supports both sequential and parallel extension strategies.
 pub struct ContigExtender {
     config: ExtenderConfig,
-    reads: Vec<String>,
+    /// Read sequences (R1 then R2), shared so a single load can back multiple
+    /// extension passes (strict + flexible) without re-reading the FASTQs.
+    reads: std::sync::Arc<Vec<String>>,
 }
 
 impl ContigExtender {
@@ -109,51 +118,46 @@ impl ContigExtender {
     pub fn new(config: ExtenderConfig) -> Self {
         Self {
             config,
-            reads: Vec::new(),
+            reads: std::sync::Arc::new(Vec::new()),
         }
     }
 
-    /// Loads paired-end reads into memory for extension.
-    ///
-    /// Reads are loaded in parallel from both files.
-    /// Both forward and reverse reads are stored for extension.
-    ///
-    /// # Arguments
-    /// * `r1_path` - Path to forward reads (R1)
-    /// * `r2_path` - Path to reverse reads (R2)
-    pub fn load_reads(&mut self, r1_path: &Path, r2_path: &Path) -> Result<()> {
+    /// Loads paired-end reads (R1 then R2) into a shared `Arc<Vec<String>>`, in
+    /// parallel from both files. Reusable across extender instances.
+    pub fn load_reads_shared(r1_path: &Path, r2_path: &Path) -> Result<std::sync::Arc<Vec<String>>> {
         eprintln!("Loading reads into memory...");
 
         let r1_owned = r1_path.to_path_buf();
         let r2_owned = r2_path.to_path_buf();
 
-        // Load R1 and R2 in parallel
-        let handle_r1 = std::thread::spawn(move || -> Result<Vec<String>> {
+        let load = |path: std::path::PathBuf| -> Result<Vec<String>> {
             let mut reads = Vec::new();
-            let mut reader = FastqFile::open(&r1_owned)?;
+            let mut reader = FastqFile::open(&path)?;
             while let Some(record) = reader.read_next()? {
                 reads.push(record.seq);
             }
             Ok(reads)
-        });
+        };
+        let handle_r1 = std::thread::spawn(move || load(r1_owned));
+        let handle_r2 = std::thread::spawn(move || load(r2_owned));
 
-        let handle_r2 = std::thread::spawn(move || -> Result<Vec<String>> {
-            let mut reads = Vec::new();
-            let mut reader = FastqFile::open(&r2_owned)?;
-            while let Some(record) = reader.read_next()? {
-                reads.push(record.seq);
-            }
-            Ok(reads)
-        });
-
-        let reads_r1 = handle_r1.join().map_err(|_| anyhow::anyhow!("R1 load thread panicked"))??;
+        let mut reads = handle_r1.join().map_err(|_| anyhow::anyhow!("R1 load thread panicked"))??;
         let reads_r2 = handle_r2.join().map_err(|_| anyhow::anyhow!("R2 load thread panicked"))??;
+        reads.extend(reads_r2);
 
-        self.reads = reads_r1;
-        self.reads.extend(reads_r2);
+        eprintln!("Loaded {} reads into memory", reads.len());
+        Ok(std::sync::Arc::new(reads))
+    }
 
-        eprintln!("Loaded {} reads into memory", self.reads.len());
+    /// Loads reads from the two FASTQs into this extender.
+    pub fn load_reads(&mut self, r1_path: &Path, r2_path: &Path) -> Result<()> {
+        self.reads = Self::load_reads_shared(r1_path, r2_path)?;
         Ok(())
+    }
+
+    /// Reuses an already-loaded shared read set (see `load_reads_shared`).
+    pub fn set_reads(&mut self, reads: std::sync::Arc<Vec<String>>) {
+        self.reads = reads;
     }
 
     /// Extends all contigs using hybrid parallel strategy.
@@ -177,10 +181,16 @@ impl ContigExtender {
                 current_seq: c.seq.clone(),
                 left_failures: 0,
                 right_failures: 0,
+                left_grown: 0,
+                right_grown: 0,
             })
         }).collect();
 
+        let t_start = std::time::Instant::now();
+        let mut rounds = 0usize;
+
         loop {
+            rounds += 1;
             // Identify contigs that still need extension
             let active_indices: Vec<usize> = states.iter().enumerate()
                 .filter(|(_, s)| {
@@ -225,79 +235,19 @@ impl ContigExtender {
                 }
             }
 
-            // Parallel read scanning with local buffers to reduce lock contention
-            let left_candidates: Mutex<FxHashMap<usize, Vec<String>>> = Mutex::new(FxHashMap::default());
-            let right_candidates: Mutex<FxHashMap<usize, Vec<String>>> = Mutex::new(FxHashMap::default());
+            // Accumulate per-position base counts (not raw reads) so peak memory is
+            // O(extension_step) per contig edge regardless of read depth.
+            let left_candidates: Mutex<FxHashMap<usize, Vec<[u32; 4]>>> = Mutex::new(FxHashMap::default());
+            let right_candidates: Mutex<FxHashMap<usize, Vec<[u32; 4]>>> = Mutex::new(FxHashMap::default());
+            let max_len = self.config.extension_step;
 
+            // Stream all reads (no index): metagenomic reads have mostly-distinct
+            // k-mers, so building a read index costs far more (tens of millions of
+            // per-k-mer allocations) than it saves — measured ~26x slower. The
+            // allocation-free streaming scan is the right structure here.
             self.reads.par_iter().for_each(|read_seq| {
-                if read_seq.len() < k {
-                    return;
-                }
-
-                // Local buffers for this read
-                let mut local_left: FxHashMap<usize, Vec<String>> = FxHashMap::default();
-                let mut local_right: FxHashMap<usize, Vec<String>> = FxHashMap::default();
-
-                for i in 0..=(read_seq.len() - k) {
-                    let kmer_seq = &read_seq[i..i+k];
-                    if let Some(hash) = compute_kmer_hash(kmer_seq) {
-                        if let Some(matches) = edge_kmers.get(&hash) {
-                            for &(contig_idx, is_left, edge_offset) in matches {
-                                let state = states[contig_idx].lock().unwrap();
-                                let contig_kmer = if is_left {
-                                    &state.current_seq[edge_offset..edge_offset+k]
-                                } else {
-                                    let clen = state.current_seq.len();
-                                    &state.current_seq[clen-k-edge_offset..clen-edge_offset]
-                                };
-
-                                let (is_forward, is_revcomp) = check_kmer_match(kmer_seq, contig_kmer);
-                                drop(state); // Release lock early
-
-                                if is_left {
-                                    if is_forward && i > edge_offset {
-                                        let prefix = &read_seq[..i - edge_offset];
-                                        if !prefix.is_empty() {
-                                            let ext: String = prefix.chars().rev().collect();
-                                            local_left.entry(contig_idx).or_default().push(ext);
-                                        }
-                                    } else if is_revcomp && i + k + edge_offset < read_seq.len() {
-                                        let suffix = &read_seq[i+k+edge_offset..];
-                                        if !suffix.is_empty() {
-                                            let ext = reverse_complement(suffix);
-                                            local_left.entry(contig_idx).or_default().push(ext);
-                                        }
-                                    }
-                                } else if is_forward && i + k + edge_offset < read_seq.len() {
-                                    let suffix = &read_seq[i+k+edge_offset..];
-                                    if !suffix.is_empty() {
-                                        local_right.entry(contig_idx).or_default().push(suffix.to_string());
-                                    }
-                                } else if is_revcomp && i > edge_offset {
-                                    let prefix = &read_seq[..i - edge_offset];
-                                    if !prefix.is_empty() {
-                                        let ext = reverse_complement(prefix);
-                                        local_right.entry(contig_idx).or_default().push(ext);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Merge local buffers to global (reduces lock contention)
-                if !local_left.is_empty() {
-                    let mut global = left_candidates.lock().unwrap();
-                    for (idx, candidates) in local_left {
-                        global.entry(idx).or_default().extend(candidates);
-                    }
-                }
-                if !local_right.is_empty() {
-                    let mut global = right_candidates.lock().unwrap();
-                    for (idx, candidates) in local_right {
-                        global.entry(idx).or_default().extend(candidates);
-                    }
-                }
+                scan_read(read_seq, &edge_kmers, &states, k, max_len,
+                          &left_candidates, &right_candidates);
             });
 
             let left_candidates = left_candidates.into_inner().unwrap();
@@ -311,25 +261,26 @@ impl ContigExtender {
 
                 // Try left extension
                 if state.left_failures < max_failures {
-                    if let Some(candidates) = left_candidates.get(&idx) {
-                        if candidates.len() >= self.config.min_coverage {
-                            let consensus = build_consensus_sequence(
-                                candidates,
-                                self.config.min_coverage,
-                                self.config.branching_threshold,
-                                self.config.extension_step,
-                            );
-                            if !consensus.is_empty() {
-                                let n_count = consensus.chars().filter(|&c| c == 'N').count();
-                                let n_ratio = n_count as f64 / consensus.len() as f64;
+                    if let Some(counts) = left_candidates.get(&idx) {
+                        let consensus = build_consensus_from_counts(
+                            counts,
+                            self.config.min_coverage,
+                            self.config.branching_threshold,
+                            self.config.extension_step,
+                        );
+                        if !consensus.is_empty() {
+                            let n_count = consensus.chars().filter(|&c| c == 'N').count();
+                            let n_ratio = n_count as f64 / consensus.len() as f64;
 
-                                if n_ratio <= self.config.max_n_ratio {
-                                    state.current_seq = format!("{}{}", consensus, state.current_seq);
-                                    state.left_failures = 0;
-                                    any_extended.store(true, std::sync::atomic::Ordering::Relaxed);
-                                } else {
-                                    state.left_failures += 1;
+                            if n_ratio <= self.config.max_n_ratio {
+                                state.current_seq = format!("{}{}", consensus, state.current_seq);
+                                state.left_failures = 0;
+                                state.left_grown += consensus.len();
+                                // Stop this side once it has enough flanking (cap).
+                                if state.left_grown >= self.config.max_extension_per_side {
+                                    state.left_failures = max_failures;
                                 }
+                                any_extended.store(true, std::sync::atomic::Ordering::Relaxed);
                             } else {
                                 state.left_failures += 1;
                             }
@@ -343,25 +294,26 @@ impl ContigExtender {
 
                 // Try right extension
                 if state.right_failures < max_failures {
-                    if let Some(candidates) = right_candidates.get(&idx) {
-                        if candidates.len() >= self.config.min_coverage {
-                            let consensus = build_consensus_sequence(
-                                candidates,
-                                self.config.min_coverage,
-                                self.config.branching_threshold,
-                                self.config.extension_step,
-                            );
-                            if !consensus.is_empty() {
-                                let n_count = consensus.chars().filter(|&c| c == 'N').count();
-                                let n_ratio = n_count as f64 / consensus.len() as f64;
+                    if let Some(counts) = right_candidates.get(&idx) {
+                        let consensus = build_consensus_from_counts(
+                            counts,
+                            self.config.min_coverage,
+                            self.config.branching_threshold,
+                            self.config.extension_step,
+                        );
+                        if !consensus.is_empty() {
+                            let n_count = consensus.chars().filter(|&c| c == 'N').count();
+                            let n_ratio = n_count as f64 / consensus.len() as f64;
 
-                                if n_ratio <= self.config.max_n_ratio {
-                                    state.current_seq = format!("{}{}", state.current_seq, consensus);
-                                    state.right_failures = 0;
-                                    any_extended.store(true, std::sync::atomic::Ordering::Relaxed);
-                                } else {
-                                    state.right_failures += 1;
+                            if n_ratio <= self.config.max_n_ratio {
+                                state.current_seq = format!("{}{}", state.current_seq, consensus);
+                                state.right_failures = 0;
+                                state.right_grown += consensus.len();
+                                // Stop this side once it has enough flanking (cap).
+                                if state.right_grown >= self.config.max_extension_per_side {
+                                    state.right_failures = max_failures;
                                 }
+                                any_extended.store(true, std::sync::atomic::Ordering::Relaxed);
                             } else {
                                 state.right_failures += 1;
                             }
@@ -378,6 +330,11 @@ impl ContigExtender {
                 break;
             }
         }
+
+        eprintln!(
+            "        [extender] {} contigs, {} rounds, {} reads, {:.1}s",
+            contigs.len(), rounds, self.reads.len(), t_start.elapsed().as_secs_f64()
+        );
 
         // Convert states to results
         let results = states.into_iter().map(|s| {
@@ -408,6 +365,9 @@ struct ContigState {
     current_seq: String,
     left_failures: usize,
     right_failures: usize,
+    /// bp added to each end so far (for the per-side extension cap).
+    left_grown: usize,
+    right_grown: usize,
 }
 
 // ============================================================================
@@ -478,6 +438,163 @@ fn reverse_complement(seq: &str) -> String {
 /// * `min_coverage` - Minimum bases required at each position
 /// * `branching_threshold` - Minor allele frequency threshold for N
 /// * `max_len` - Maximum consensus length
+/// Scan one read against the contig-edge k-mer index and accumulate its overhangs
+/// (as per-position base counts) into the shared left/right count matrices. Shared
+/// by both the full-scan and indexed dispatch paths so they produce identical output.
+#[allow(clippy::too_many_arguments)]
+fn scan_read(
+    read_seq: &str,
+    edge_kmers: &FxHashMap<u64, Vec<(usize, bool, usize)>>,
+    states: &[Mutex<ContigState>],
+    k: usize,
+    max_len: usize,
+    left_candidates: &Mutex<FxHashMap<usize, Vec<[u32; 4]>>>,
+    right_candidates: &Mutex<FxHashMap<usize, Vec<[u32; 4]>>>,
+) {
+    if read_seq.len() < k {
+        return;
+    }
+    let mut local_left: FxHashMap<usize, Vec<[u32; 4]>> = FxHashMap::default();
+    let mut local_right: FxHashMap<usize, Vec<[u32; 4]>> = FxHashMap::default();
+
+    for i in 0..=(read_seq.len() - k) {
+        let kmer_seq = &read_seq[i..i + k];
+        if let Some(hash) = compute_kmer_hash(kmer_seq) {
+            if let Some(matches) = edge_kmers.get(&hash) {
+                for &(contig_idx, is_left, edge_offset) in matches {
+                    let state = states[contig_idx].lock().unwrap();
+                    let contig_kmer = if is_left {
+                        &state.current_seq[edge_offset..edge_offset + k]
+                    } else {
+                        let clen = state.current_seq.len();
+                        &state.current_seq[clen - k - edge_offset..clen - edge_offset]
+                    };
+
+                    let (is_forward, is_revcomp) = check_kmer_match(kmer_seq, contig_kmer);
+                    drop(state); // Release lock early
+
+                    if is_left {
+                        if is_forward && i > edge_offset {
+                            let prefix = &read_seq[..i - edge_offset];
+                            if !prefix.is_empty() {
+                                let ext: String = prefix.chars().rev().collect();
+                                accumulate_counts(local_left.entry(contig_idx).or_default(), &ext, max_len);
+                            }
+                        } else if is_revcomp && i + k + edge_offset < read_seq.len() {
+                            let suffix = &read_seq[i + k + edge_offset..];
+                            if !suffix.is_empty() {
+                                let ext = reverse_complement(suffix);
+                                accumulate_counts(local_left.entry(contig_idx).or_default(), &ext, max_len);
+                            }
+                        }
+                    } else if is_forward && i + k + edge_offset < read_seq.len() {
+                        let suffix = &read_seq[i + k + edge_offset..];
+                        if !suffix.is_empty() {
+                            accumulate_counts(local_right.entry(contig_idx).or_default(), suffix, max_len);
+                        }
+                    } else if is_revcomp && i > edge_offset {
+                        let prefix = &read_seq[..i - edge_offset];
+                        if !prefix.is_empty() {
+                            let ext = reverse_complement(prefix);
+                            accumulate_counts(local_right.entry(contig_idx).or_default(), &ext, max_len);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !local_left.is_empty() {
+        let mut global = left_candidates.lock().unwrap();
+        for (idx, local_counts) in local_left {
+            merge_counts(global.entry(idx).or_default(), &local_counts);
+        }
+    }
+    if !local_right.is_empty() {
+        let mut global = right_candidates.lock().unwrap();
+        for (idx, local_counts) in local_right {
+            merge_counts(global.entry(idx).or_default(), &local_counts);
+        }
+    }
+}
+
+/// Accumulate one oriented overhang's bases into a per-position [A,T,G,C] count
+/// matrix (index 0 = first base past the contig edge). Non-ACGT bases are skipped
+/// (matching build_consensus_sequence). Positions beyond `max_len` are ignored.
+/// This lets extension consensus be built incrementally without ever storing the
+/// raw reads — bounding memory to O(max_len) per contig edge regardless of depth.
+fn accumulate_counts(counts: &mut Vec<[u32; 4]>, overhang: &str, max_len: usize) {
+    for (i, c) in overhang.bytes().enumerate() {
+        if i >= max_len {
+            break;
+        }
+        let bi = match c.to_ascii_uppercase() {
+            b'A' => 0,
+            b'T' => 1,
+            b'G' => 2,
+            b'C' => 3,
+            _ => continue,
+        };
+        if i >= counts.len() {
+            counts.resize(i + 1, [0; 4]);
+        }
+        counts[i][bi] += 1;
+    }
+}
+
+/// Element-wise add a (thread-local) count matrix into a shared one.
+fn merge_counts(dst: &mut Vec<[u32; 4]>, src: &[[u32; 4]]) {
+    if dst.len() < src.len() {
+        dst.resize(src.len(), [0; 4]);
+    }
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        for b in 0..4 {
+            d[b] += s[b];
+        }
+    }
+}
+
+/// Consensus from a per-position [A,T,G,C] count matrix. Identical decision logic
+/// to `build_consensus_sequence` (majority base per position; 'N' when the minor
+/// allele frequency >= branching_threshold; stop at the first position with
+/// coverage < min_coverage), but reads all positions from accumulated counts so no
+/// raw reads are retained. Using ALL reads (no truncation) makes the consensus
+/// exact, not a sampled approximation.
+fn build_consensus_from_counts(
+    counts: &[[u32; 4]],
+    min_coverage: usize,
+    branching_threshold: f64,
+    max_len: usize,
+) -> String {
+    let mut result = String::new();
+    for col in counts.iter().take(max_len) {
+        let total: u32 = col.iter().sum();
+        if (total as usize) < min_coverage {
+            break;
+        }
+        let max_idx = col.iter().enumerate().max_by_key(|&(_, &c)| c).map(|(i, _)| i).unwrap_or(0);
+        let mut sorted = *col;
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let minor_freq = sorted[1] as f64 / total as f64;
+        let base = if minor_freq >= branching_threshold {
+            'N'
+        } else {
+            match max_idx {
+                0 => 'A',
+                1 => 'T',
+                2 => 'G',
+                3 => 'C',
+                _ => 'N',
+            }
+        };
+        result.push(base);
+    }
+    result
+}
+
+/// Reference (string-based) consensus, retained as the correctness oracle for
+/// `build_consensus_from_counts` (see test_count_consensus_matches_string_version).
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_consensus_sequence(
     sequences: &[String],
     min_coverage: usize,
@@ -607,4 +724,82 @@ mod tests {
         assert_eq!(consensus, "ATGC");
     }
 
+    /// Count-based consensus must extend correctly and be independent of read depth:
+    /// 50 vs 50000 agreeing reads give the SAME extension (the count matrix uses all
+    /// reads, no truncation). This is the memory fix — raw reads are never stored.
+    #[test]
+    fn test_count_consensus_extension() {
+        // Non-repetitive contig + a distinct right-side extension truth.
+        let contig = "GTTCAGACCTAGGCATTACGGATCCGATTACGGCATTAGCCATTAGGCAT";
+        let ext_truth = "ACAGTGGTCATGCATGCTAGCTAGCATCGAT";
+        // Reads share the contig's right edge and carry the extension.
+        let read = format!("{}{}", &contig[contig.len() - 40..], ext_truth);
+        let contigs = vec![FastaRecord { name: "c1".into(), seq: contig.to_string() }];
+
+        let run = |n_reads: usize| -> String {
+            let mut cfg = ExtenderConfig::default();
+            cfg.max_consecutive_failures = 1;
+            let mut ext = ContigExtender::new(cfg);
+            ext.reads = std::sync::Arc::new(std::iter::repeat(read.clone()).take(n_reads).collect());
+            ext.extend_contigs(&contigs).unwrap()[0].extended_seq.clone()
+        };
+
+        let few = run(50);
+        let many = run(50_000);
+        assert_eq!(few, many, "extension depends on read depth (should not)");
+        // And the extension actually happened (grew past the original contig).
+        assert!(few.len() > contig.len(), "no extension occurred");
+        assert!(few.contains(contig), "original contig not preserved");
+    }
+
+    /// The count matrix must reproduce build_consensus_sequence exactly (majority
+    /// base, 'N' on branching, stop below min_coverage).
+    #[test]
+    fn test_count_consensus_matches_string_version() {
+        let seqs = vec![
+            "ACGT".to_string(),
+            "ACGT".to_string(),
+            "ACTT".to_string(), // position 2 branches: G vs T
+        ];
+        let mut counts: Vec<[u32; 4]> = Vec::new();
+        for s in &seqs {
+            accumulate_counts(&mut counts, s, 100);
+        }
+        let from_counts = build_consensus_from_counts(&counts, 2, 0.2, 100);
+        let from_strings = build_consensus_sequence(&seqs, 2, 0.2, 100);
+        assert_eq!(from_counts, from_strings);
+    }
+
+    /// Peak RSS (VmHWM, KB) of this process, from /proc/self/status.
+    fn peak_rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    /// Micro-benchmark (node-load-independent): the per-position count matrix bounds
+    /// extension memory regardless of read depth — the explosion (millions of reads
+    /// on ONE contig edge) now adds ~0. Run with `--ignored --nocapture`; vary NREADS
+    /// to confirm the RSS delta stays flat.
+    #[test]
+    #[ignore]
+    fn bench_count_memory() {
+        let n_reads: usize = std::env::var("NREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+        let contig = "GTTCAGACCTAGGCATTACGGATCCGATTACGGCATTAGCCATTAGGCAT";
+        let ext_truth = "ACAGTGGTCATGCATGCTAGCTAGCATCGAT";
+        let read = format!("{}{}", &contig[contig.len() - 40..], ext_truth);
+        let contigs = vec![FastaRecord { name: "c1".into(), seq: contig.to_string() }];
+
+        let mut cfg = ExtenderConfig::default();
+        cfg.max_consecutive_failures = 1;
+        let mut ext = ContigExtender::new(cfg);
+        ext.reads = std::sync::Arc::new(std::iter::repeat(read.clone()).take(n_reads).collect());
+        let reads_rss = peak_rss_kb();
+        let out = ext.extend_contigs(&contigs).unwrap();
+        let after = peak_rss_kb();
+        eprintln!("NREADS={} | reads_loaded={}MB after_extend={}MB | delta_extend={}MB | ext_len={}",
+            n_reads, reads_rss / 1024, after / 1024, (after.saturating_sub(reads_rss)) / 1024, out[0].extended_seq.len());
+    }
 }

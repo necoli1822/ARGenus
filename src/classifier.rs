@@ -52,6 +52,10 @@ pub struct ArgPosition {
 }
 
 /// Genus classification result for a single ARG.
+/// Two genera are "tied" (indistinguishable) when their scores are within this many
+/// identity points. Used to decide multi-genus reporting.
+pub const GENUS_TIE_PCT: f64 = 1.0;
+
 #[derive(Debug, Clone)]
 pub struct GenusResult {
     /// ARG gene name.
@@ -72,6 +76,24 @@ pub struct GenusResult {
     pub top_matches: Vec<(String, f64)>,
     /// SNP verification status (for point mutation ARGs).
     pub snp_status: SnpStatus,
+    /// Extracted upstream flanking sequence (retained for export/inspection of
+    /// unresolved loci — e.g. flanking present but no flanking-DB match).
+    pub upstream_seq: String,
+    /// Extracted downstream flanking sequence (retained for export/inspection).
+    pub downstream_seq: String,
+    /// Replicon context of the matched reference flanking: "plasmid" (mobile, genus
+    /// unreliable), "chromosome", "ambiguous", or "NA" (no plasmid list loaded).
+    pub context: String,
+    /// Number of genera within GENUS_TIE_PCT of the top score (from the full score
+    /// list, not just top-5). ≥2 means the call cannot be pinned to a single genus.
+    pub n_genera_tied: usize,
+    /// Best species (binomial) when a species map is loaded and matches clear the
+    /// (higher) species identity threshold; None if unavailable/undeterminable.
+    pub species: Option<String>,
+    /// Top species matches with scores, for multi-species reporting.
+    pub species_top_matches: Vec<(String, f64)>,
+    /// Number of species within GENUS_TIE_PCT of the top species score.
+    pub n_species_tied: usize,
 }
 
 impl Default for GenusResult {
@@ -86,6 +108,13 @@ impl Default for GenusResult {
             downstream_len: 0,
             top_matches: vec![],
             snp_status: SnpStatus::NotApplicable,
+            upstream_seq: String::new(),
+            downstream_seq: String::new(),
+            context: "NA".to_string(),
+            n_genera_tied: 0,
+            species: None,
+            species_top_matches: vec![],
+            n_species_tied: 0,
         }
     }
 }
@@ -309,6 +338,17 @@ pub struct GenusClassifier {
     min_identity: f64,
     min_align_len: usize,
     max_flanking: usize,
+    /// Source contig accessions known to be plasmids (from PLSDB-derived flanking).
+    /// Empty if no plasmid list was provided → Context reported as "NA".
+    plasmid_contigs: rustc_hash::FxHashSet<String>,
+    /// Higher identity threshold (0-1) required to call species. 0 disables species.
+    species_identity: f64,
+    /// Source contig accession → species (binomial). Empty disables species calls.
+    species_map: FxHashMap<String, String>,
+    /// Plasmid-fraction thresholds for the Context call: frac >= `plasmid_hi`
+    /// → "plasmid", frac <= `plasmid_lo` → "chromosome", else "ambiguous".
+    plasmid_hi: f64,
+    plasmid_lo: f64,
 }
 
 impl GenusClassifier {
@@ -326,14 +366,43 @@ impl GenusClassifier {
         min_identity: f64,
         min_align_len: usize,
         max_flanking: usize,
+        plasmid_contigs_path: Option<&Path>,
+        species_identity: f64,
+        species_map_path: Option<&Path>,
+        plasmid_hi: f64,
+        plasmid_lo: f64,
     ) -> Result<Self> {
         let db = FlankingDatabase::open(db_path)?;
+        let mut plasmid_contigs = rustc_hash::FxHashSet::default();
+        if let Some(p) = plasmid_contigs_path {
+            let f = File::open(p).with_context(|| format!("open plasmid list {:?}", p))?;
+            for line in BufReader::new(f).lines() {
+                let acc = line?.trim().to_string();
+                if !acc.is_empty() { plasmid_contigs.insert(acc); }
+            }
+        }
+        let mut species_map = FxHashMap::default();
+        if let Some(p) = species_map_path {
+            let f = File::open(p).with_context(|| format!("open species map {:?}", p))?;
+            for line in BufReader::new(f).lines() {
+                let line = line?;
+                if let Some((c, sp)) = line.split_once('\t') {
+                    let (c, sp) = (c.trim(), sp.trim());
+                    if !c.is_empty() && !sp.is_empty() { species_map.insert(c.to_string(), sp.to_string()); }
+                }
+            }
+        }
         Ok(Self {
             db,
             minimap2_path: minimap2_path.to_string(),
             min_identity,
             min_align_len,
             max_flanking,
+            plasmid_contigs,
+            species_identity,
+            species_map,
+            plasmid_hi,
+            plasmid_lo,
         })
     }
 
@@ -389,6 +458,13 @@ impl GenusClassifier {
                 downstream_len,
                 top_matches: vec![],
                 snp_status,
+                upstream_seq: upstream.clone(),
+                downstream_seq: downstream.clone(),
+                context: "NA".to_string(),
+                n_genera_tied: 0,
+                species: None,
+                species_top_matches: vec![],
+                n_species_tied: 0,
             });
         }
 
@@ -404,6 +480,13 @@ impl GenusClassifier {
                 downstream_len,
                 top_matches: vec![("gene_not_in_db".to_string(), 0.0)],
                 snp_status,
+                upstream_seq: upstream.clone(),
+                downstream_seq: downstream.clone(),
+                context: "NA".to_string(),
+                n_genera_tied: 0,
+                species: None,
+                species_top_matches: vec![],
+                n_species_tied: 0,
             });
         }
 
@@ -420,6 +503,13 @@ impl GenusClassifier {
                 downstream_len,
                 top_matches: vec![("no_ref_records".to_string(), 0.0)],
                 snp_status,
+                upstream_seq: upstream.clone(),
+                downstream_seq: downstream.clone(),
+                context: "NA".to_string(),
+                n_genera_tied: 0,
+                species: None,
+                species_top_matches: vec![],
+                n_species_tied: 0,
             });
         }
 
@@ -484,16 +574,37 @@ impl GenusClassifier {
                 downstream_len,
                 top_matches: vec![("minimap2_failed".to_string(), 0.0)],
                 snp_status,
+                upstream_seq: upstream.clone(),
+                downstream_seq: downstream.clone(),
+                context: "NA".to_string(),
+                n_genera_tied: 0,
+                species: None,
+                species_top_matches: vec![],
+                n_species_tied: 0,
             });
         }
 
-        // Parse PAF and calculate genus scores
-        let genus_scores = self.calculate_genus_scores(&paf_path)?;
+        // Parse PAF and calculate genus scores + plasmid provenance + species scores.
+        let (genus_scores, plasmid_frac, species_scores) = self.calculate_genus_scores(&paf_path)?;
 
         // Cleanup temporary files
         let _ = std::fs::remove_file(&query_path);
         let _ = std::fs::remove_file(&ref_path);
         let _ = std::fs::remove_file(&paf_path);
+
+        // Context from provenance of the matched reference flanking (mobility proxy).
+        // "plasmid" = the flanking mostly matched PLSDB-derived plasmid references
+        // (genus is then unreliable — the ARG is on a mobile element). NA when no
+        // plasmid list is loaded OR the flanking matched nothing (no basis to judge).
+        let context = if self.plasmid_contigs.is_empty() || genus_scores.is_empty() {
+            "NA".to_string()
+        } else if plasmid_frac >= self.plasmid_hi {
+            "plasmid".to_string()
+        } else if plasmid_frac <= self.plasmid_lo {
+            "chromosome".to_string()
+        } else {
+            "ambiguous".to_string()
+        };
 
         // Calculate genus specificity from database
         let genus_dist = self.db.get_genus_distribution(&pos.arg_name)?;
@@ -516,7 +627,28 @@ impl GenusClassifier {
             (None, 0.0, 0.0)
         };
 
+        // Count ALL genera tied near the top (from the full list, before truncation),
+        // so multi-genus reporting can state the true breadth even beyond top-5.
+        let n_genera_tied = match sorted_scores.first() {
+            Some((_, best)) => sorted_scores.iter()
+                .filter(|(g, s)| !g.is_empty() && *s >= best - GENUS_TIE_PCT)
+                .count(),
+            None => 0,
+        };
+
         let top_matches: Vec<(String, f64)> = sorted_scores.into_iter().take(5).collect();
+
+        // Species resolution (parallel to genus, from the higher-threshold tally).
+        let mut sorted_species: Vec<(String, f64)> = species_scores.into_iter().collect();
+        sorted_species.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let species = sorted_species.first().map(|(s, _)| s.clone());
+        let n_species_tied = match sorted_species.first() {
+            Some((_, best)) => sorted_species.iter()
+                .filter(|(s, sc)| !s.is_empty() && *sc >= best - GENUS_TIE_PCT)
+                .count(),
+            None => 0,
+        };
+        let species_top_matches: Vec<(String, f64)> = sorted_species.into_iter().take(5).collect();
 
         Ok(GenusResult {
             arg_name: pos.arg_name.clone(),
@@ -528,6 +660,13 @@ impl GenusClassifier {
             downstream_len,
             top_matches,
             snp_status,
+            upstream_seq: upstream.clone(),
+            downstream_seq: downstream.clone(),
+            context,
+            n_genera_tied,
+            species,
+            species_top_matches,
+            n_species_tied,
         })
     }
 
@@ -564,12 +703,19 @@ impl GenusClassifier {
     }
 
     /// Parses PAF alignment file and calculates genus scores.
-    fn calculate_genus_scores(&self, paf_path: &Path) -> Result<FxHashMap<String, f64>> {
+    fn calculate_genus_scores(&self, paf_path: &Path) -> Result<(FxHashMap<String, f64>, f64, FxHashMap<String, f64>)> {
         let file = File::open(paf_path)?;
         let reader = BufReader::new(file);
 
         let mut genus_matches: FxHashMap<String, Vec<f64>> = FxHashMap::default();
         let min_identity_pct = self.min_identity * 100.0;
+        // Track plasmid provenance of the matched reference flanking records.
+        let (mut plasmid_hits, mut total_hits) = (0usize, 0usize);
+        // Species tally (only alignments clearing the higher species threshold whose
+        // source contig has a species label).
+        let mut species_matches: FxHashMap<String, Vec<f64>> = FxHashMap::default();
+        let species_pct = self.species_identity * 100.0;
+        let do_species = self.species_identity > 0.0 && !self.species_map.is_empty();
 
         for line in reader.lines() {
             let line = line?;
@@ -595,10 +741,27 @@ impl GenusClassifier {
                 continue;
             }
 
-            // Extract genus from target name (genus|assembly|direction_idx)
+            // Target name is "genus|contig|direction_idx".
             let target_name = fields[5];
-            if let Some(genus) = target_name.split('|').next() {
-                genus_matches.entry(genus.to_string()).or_default().push(identity);
+            let mut toks = target_name.split('|');
+            let genus = toks.next().unwrap_or("");
+            let contig = toks.next().unwrap_or("");
+            // Skip records with an empty genus label (DB label gaps) — they must not
+            // win the classification (fix for the empty-"" winner bug).
+            if genus.is_empty() {
+                continue;
+            }
+            total_hits += 1;
+            if !contig.is_empty() && self.plasmid_contigs.contains(contig) {
+                plasmid_hits += 1;
+            }
+            genus_matches.entry(genus.to_string()).or_default().push(identity);
+
+            // Species tally: stricter identity + a species label for this contig.
+            if do_species && identity >= species_pct {
+                if let Some(sp) = self.species_map.get(contig) {
+                    species_matches.entry(sp.clone()).or_default().push(identity);
+                }
             }
         }
 
@@ -614,7 +777,15 @@ impl GenusClassifier {
             genus_scores.insert(genus, avg_identity * count_bonus / count_bonus.max(1.0));
         }
 
-        Ok(genus_scores)
+        let mut species_scores: FxHashMap<String, f64> = FxHashMap::default();
+        for (sp, scores) in species_matches {
+            if scores.is_empty() { continue; }
+            let avg = scores.iter().sum::<f64>() / scores.len() as f64;
+            species_scores.insert(sp, avg);
+        }
+
+        let plasmid_frac = if total_hits > 0 { plasmid_hits as f64 / total_hits as f64 } else { 0.0 };
+        Ok((genus_scores, plasmid_frac, species_scores))
     }
 
 }

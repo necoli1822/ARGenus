@@ -7,6 +7,7 @@ mod flanking_db;
 mod arg_db;
 mod fdb;
 mod flanking_db_ntprok;
+mod reassemble;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -59,7 +60,7 @@ A targeted assembly pipeline that:
   4. Detects ARGs and classifies source genus using flanking sequences
 
 WORKFLOW:
-  Reads → minimap2 filter → MEGAHIT assembly → Extension → ARG detection → Genus classification
+  Reads → read filter (strobealign/minimap2/bwa-mem2) → MEGAHIT assembly → Extension → ARG detection → Genus classification
 
 ALIGNMENT TIE-BREAKING (for equal-score hits):
   Priority: Score (higher first) → Gene length (higher first) → MapQ (higher first)
@@ -91,7 +92,7 @@ EXAMPLES:
   argenus -l samples.txt -a AMR_NCBI.mmi -f flanking.fdb -o results/
 "#)]
 #[command(after_help = r#"
-For more information, visit: https://github.com/your-repo/argenus
+For more information, visit: https://github.com/necoli1822/ARGenus
 "#)]
 struct Args {
     // ===== INPUT OPTIONS =====
@@ -132,6 +133,13 @@ struct Args {
     /// Flanking sequence database (.fdb format) for genus classification
     #[arg(short = 'f', long = "flanking-db", value_name = "FILE", help_heading = "Database")]
     flanking_db: Option<PathBuf>,
+
+    /// Database directory: auto-discovers the ARG reference (.mmi or FASTA), the
+    /// flanking DB (.fdb), and the optional plasmid_contigs.txt / contig_species.tsv
+    /// inside it — a one-flag alternative to giving -a/-f separately. Explicit
+    /// -a/-f/--plasmid-contigs/--species-map still override what's found here.
+    #[arg(short = 'd', long = "db-dir", value_name = "DIR", help_heading = "Database")]
+    db_dir: Option<PathBuf>,
 
     /// NCBI email for API access (required for --build-db flank)
     /// Provides higher rate limits (10 req/s vs 5 req/s)
@@ -224,6 +232,13 @@ struct Args {
     #[arg(short = 'g', long, value_name = "BP", default_value = "200", help_heading = "Assembly")]
     min_contig_len: usize,
 
+    /// Cap on bp added to EACH contig end during extension [0 = auto 2×max-flanking].
+    /// Classification uses only ~max-flanking of flanking, so capping stops runaway
+    /// contigs (which otherwise force many extra read-rescan rounds) with no loss.
+    /// Set very high to disable the cap.
+    #[arg(long = "max-extension", value_name = "BP", default_value = "0", help_heading = "Assembly")]
+    max_extension: usize,
+
     /// K-mer size for contig extension [31-127, odd]
     #[arg(short = 'k', long, value_name = "SIZE", default_value = "62", help_heading = "Assembly")]
     ext_kmer_size: usize,
@@ -232,7 +247,104 @@ struct Args {
     #[arg(short = 'j', long, value_name = "BP", default_value = "100", help_heading = "Assembly")]
     ext_length: usize,
 
+    /// Cap read depth in contig INTERIORS before extension [0 = off].
+    /// The extender only uses reads matching contig-edge k-mers, so interior
+    /// reads (>= --end-zone bp from both ends) are redundant. Terminal-zone and
+    /// unmapped reads are always kept; interior coverage is capped to this value.
+    /// Cuts extension memory on high-abundance loci without losing flanking.
+    #[arg(long = "cap-interior", value_name = "X", default_value = "0", help_heading = "Assembly")]
+    cap_interior: usize,
+
+    /// Distance from each contig end kept at full depth for --cap-interior (bp)
+    #[arg(long = "end-zone", value_name = "BP", default_value = "150", help_heading = "Assembly")]
+    end_zone: usize,
+
+    /// Classify a pre-assembled contig FASTA (skip read filtering/assembly).
+    /// Runs only ARG detection + genus classification + unresolved exports on the
+    /// given contigs and writes results.tsv. Enables A/B testing of alternative
+    /// assemblies (e.g. per-locus reassembly) without rerunning the read pipeline.
+    #[arg(long = "classify-contigs", value_name = "FASTA", help_heading = "Assembly")]
+    classify_contigs: Option<PathBuf>,
+
+    /// List of plasmid source-contig accessions (one per line), used to report the
+    /// replicon Context (plasmid/chromosome) of each ARG's flanking. When the
+    /// flanking mostly matches plasmid-derived references the genus is unreliable
+    /// (mobile element). Without this, Context is reported as "NA".
+    #[arg(long = "plasmid-contigs", value_name = "FILE", help_heading = "Classification")]
+    plasmid_contigs: Option<PathBuf>,
+
+    /// Contig→species map (TSV: contig<TAB>species) for species-level reporting.
+    /// Auto-loaded from contig_species.tsv beside the flanking DB if present.
+    #[arg(long = "species-map", value_name = "FILE", help_heading = "Classification")]
+    species_map: Option<PathBuf>,
+
+    /// Minimum flanking identity to distinguish GENERA [0.8-1.0].
+    #[arg(long = "genus-identity", value_name = "F", default_value = "0.90", help_heading = "Classification")]
+    genus_identity: f64,
+
+    /// Minimum flanking identity to call SPECIES (higher than genus; species need
+    /// near-identical flanking). Set 0 to disable species reporting. Default 0.96
+    /// tuned on the low benchmark: recovers over-strict cases while keeping
+    /// chromosome-context species precision ~94%.
+    #[arg(long = "species-identity", value_name = "F", default_value = "0.96", help_heading = "Classification")]
+    species_identity: f64,
+
+    /// Context call: plasmid-fraction of matched flanking >= this → "plasmid".
+    /// Tuned 0.5 on the low benchmark (plasmid calls ~95% correct).
+    #[arg(long = "context-plasmid-frac", value_name = "F", default_value = "0.5", help_heading = "Classification")]
+    context_plasmid_frac: f64,
+
+    /// Context call: plasmid-fraction of matched flanking <= this → "chromosome".
+    /// Between the two thresholds → "ambiguous". Tuned 0.1 (chromosome ~90% correct).
+    #[arg(long = "context-chromosome-frac", value_name = "F", default_value = "0.1", help_heading = "Classification")]
+    context_chromosome_frac: f64,
+
+    // ===== LOCUS OUTPUTS =====
+    /// Emit per-locus FASTA outputs for selected classes. Comma list of any of:
+    /// resolved (genus assigned), flanknomatch (gene in flank-DB but flank did not
+    /// match), genenotindb (gene absent from flank-DB). Providing any --emit-*
+    /// flag turns the feature on; an unspecified dimension defaults to all.
+    #[arg(long = "emit-class", value_delimiter = ',', value_name = "LIST", help_heading = "Locus outputs")]
+    emit_class: Vec<String>,
+
+    /// Parts to emit: comma list of gene (ARG-DB-matched region), flank (terminal
+    /// flanking). Default: both (when the feature is on).
+    #[arg(long = "emit-part", value_delimiter = ',', value_name = "LIST", help_heading = "Locus outputs")]
+    emit_part: Vec<String>,
+
+    /// States to emit: comma list of asm (assembled contig sequence), reads (reads
+    /// mapping to the region). Default: both. 'reads' needs the read pipeline
+    /// (ignored with a warning in --classify-contigs).
+    #[arg(long = "emit-state", value_delimiter = ',', value_name = "LIST", help_heading = "Locus outputs")]
+    emit_state: Vec<String>,
+
     // ===== READ FILTERING =====
+    /// Read-filter aligner: 'strobealign' (default), 'minimap2', or 'bwa-mem2'.
+    /// strobealign/bwa-mem2 require a FASTA reference (see --ref-fasta); they map
+    /// R1+R2 as pairs, emit SAM, and it is converted to PAF so the downstream
+    /// identity/block-length filter is identical to minimap2.
+    /// Use '--mapper minimap2' to restore the original minimap2 read filter.
+    #[arg(long = "mapper", value_name = "TOOL", default_value = "strobealign",
+          value_parser = ["minimap2", "strobealign", "bwa-mem2"], help_heading = "Read Filtering")]
+    mapper: String,
+
+    /// FASTA reference for --mapper strobealign|bwa-mem2 (they cannot read a .mmi).
+    /// If omitted, argenus tries to derive it from --arg-db (e.g. foo.mmi -> foo.fa/.fas/.fasta).
+    #[arg(long = "ref-fasta", value_name = "FILE", help_heading = "Read Filtering")]
+    ref_fasta: Option<PathBuf>,
+
+    /// Path to strobealign executable (default: search PATH)
+    #[arg(long = "strobealign-path", value_name = "FILE", help_heading = "Read Filtering")]
+    strobealign_path: Option<PathBuf>,
+
+    /// Path to bwa-mem2 executable (default: search PATH)
+    #[arg(long = "bwa-mem2-path", value_name = "FILE", help_heading = "Read Filtering")]
+    bwa_mem2_path: Option<PathBuf>,
+
+    /// Path to paftools.sh for SAM->PAF (optional; a built-in converter is used if absent)
+    #[arg(long = "paftools-path", value_name = "FILE", help_heading = "Read Filtering")]
+    paftools_path: Option<PathBuf>,
+
     /// Minimum alignment identity for read filtering [0.0-1.0]
     #[arg(short = 'm', long, value_name = "FLOAT", default_value = "0.80", help_heading = "Read Filtering")]
     identity: f64,
@@ -254,6 +366,28 @@ struct Args {
     #[arg(short = 'y', long, help_heading = "Runtime")]
     yes: bool,
 
+    /// Per-locus reassembly (v3 core/flank read split + SPAdes) for STALLED loci
+    /// (short flanking, non-plasmid). Opt-in: recovers a classifiable flanking for
+    /// loci that are NA on every axis. Requires --spades-path (or the default pixi
+    /// SPAdes). Plasmid-context loci are skipped (reassembly can't fix a mobile-
+    /// element genus).
+    #[arg(long, help_heading = "Reassembly")]
+    reassemble: bool,
+
+    /// Path to spades.py (default: search PATH). Only used with --reassemble.
+    #[arg(long, value_name = "FILE", default_value = "spades.py", help_heading = "Reassembly")]
+    spades_path: PathBuf,
+
+    /// Python interpreter to run SPAdes (its env python; the system python is often
+    /// too old). Default: sibling python3 of --spades-path. Empty => call spades.py
+    /// directly.
+    #[arg(long, value_name = "FILE", help_heading = "Reassembly")]
+    spades_python: Option<PathBuf>,
+
+    /// Concurrent SPAdes jobs during reassembly.
+    #[arg(long, value_name = "NUM", default_value = "4", help_heading = "Reassembly")]
+    reassemble_jobs: usize,
+
     // Internal fields (not CLI options)
     /// Path to minimap2 (auto-detected)
     #[arg(skip)]
@@ -262,6 +396,18 @@ struct Args {
     /// Path to megahit (auto-detected)
     #[arg(skip)]
     megahit: String,
+
+    /// Resolved path to strobealign (set in main when --mapper strobealign)
+    #[arg(skip)]
+    strobealign: String,
+
+    /// Resolved path to bwa-mem2 (set in main when --mapper bwa-mem2)
+    #[arg(skip)]
+    bwa_mem2: String,
+
+    /// Resolved FASTA reference for alt mappers (set in main)
+    #[arg(skip)]
+    ref_fasta_resolved: Option<PathBuf>,
 }
 
 /// Find executable in system PATH
@@ -340,6 +486,59 @@ struct ResultRow {
     extension_method: String,  // "strict" (tadpole) or "flexible" (rust extender)
     top_matches: String,
     snp_status: String,  // SNP verification status for point mutation ARGs
+    context: String,     // replicon context: plasmid / chromosome / ambiguous / NA
+    species: String,     // species call (or multi-species(N):... / Unknown)
+}
+
+/// Formats the reported genus from a classification result. When several genera are
+/// near-tied (within GENUS_TIE_PCT of the top score), the ARG cannot be assigned to a
+/// single genus (e.g. a promiscuous plasmid gene). We then report the TRUE count of
+/// tied genera and list up to 5, e.g. "multi-genus(12):A/B/C/D/E(+7)".
+fn format_genus_call(res: &GenusResult) -> String {
+    let best = match &res.genus {
+        Some(g) => g.clone(),
+        None => return "Unknown".to_string(),
+    };
+    if res.n_genera_tied < 2 {
+        return best;
+    }
+    let top = res.top_matches.first().map(|(_, s)| *s).unwrap_or(0.0);
+    let shown: Vec<String> = res.top_matches.iter()
+        .filter(|(g, s)| !g.is_empty() && *s >= top - classifier::GENUS_TIE_PCT)
+        .map(|(g, _)| g.clone())
+        .take(5)
+        .collect();
+    let remainder = res.n_genera_tied.saturating_sub(shown.len());
+    if remainder > 0 {
+        format!("multi-genus({}):{}(+{})", res.n_genera_tied, shown.join("/"), remainder)
+    } else {
+        format!("multi-genus({}):{}", res.n_genera_tied, shown.join("/"))
+    }
+}
+
+/// Formats the species call, mirroring `format_genus_call`: single species, or
+/// "multi-species(N):s1/s2/...(+K)" when several species are tied. "Unknown" when
+/// no species cleared the species-identity threshold (e.g. plasmid/short flanking).
+fn format_species_call(res: &GenusResult) -> String {
+    let best = match &res.species {
+        Some(s) => s.clone(),
+        None => return "Unknown".to_string(),
+    };
+    if res.n_species_tied < 2 {
+        return best;
+    }
+    let top = res.species_top_matches.first().map(|(_, s)| *s).unwrap_or(0.0);
+    let shown: Vec<String> = res.species_top_matches.iter()
+        .filter(|(s, sc)| !s.is_empty() && *sc >= top - classifier::GENUS_TIE_PCT)
+        .map(|(s, _)| s.clone())
+        .take(5)
+        .collect();
+    let remainder = res.n_species_tied.saturating_sub(shown.len());
+    if remainder > 0 {
+        format!("multi-species({}):{}(+{})", res.n_species_tied, shown.join("/"), remainder)
+    } else {
+        format!("multi-species({}):{}", res.n_species_tied, shown.join("/"))
+    }
 }
 
 /// Detected ARG information with position
@@ -786,21 +985,127 @@ fn main() -> Result<()> {
         );
     }
 
+    // Resolve --db-dir: fill in any DB path not given explicitly by discovering it
+    // in the directory. Explicit -a/-f/etc. always win.
+    if let Some(dir) = args.db_dir.clone() {
+        if !dir.is_dir() {
+            anyhow::bail!("--db-dir is not a directory: {}", dir.display());
+        }
+        if args.arg_db.is_none() {
+            // Prefer a minimap2 index; fall back to a FASTA (plain or .gz — works
+            // for both mappers).
+            args.arg_db = find_db_file(&dir, &["mmi"])
+                .or_else(|| find_fasta_file(&dir));
+        }
+        if args.flanking_db.is_none() {
+            args.flanking_db = find_flanking_db(&dir);
+        }
+        if args.ref_fasta.is_none() {
+            args.ref_fasta = find_fasta_file(&dir);
+        }
+        if args.plasmid_contigs.is_none() {
+            let p = dir.join("plasmid_contigs.txt");
+            if p.exists() { args.plasmid_contigs = Some(p); }
+        }
+        if args.species_map.is_none() {
+            let p = dir.join("contig_species.tsv");
+            if p.exists() { args.species_map = Some(p); }
+        }
+        if args.verbose {
+            eprintln!("--db-dir {}: arg-db={:?} flanking-db={:?}",
+                      dir.display(), args.arg_db, args.flanking_db);
+        }
+    }
+
     // Validate required arguments for analysis mode
     if args.arg_db.is_none() {
-        anyhow::bail!("--arg-db is required for analysis mode");
+        anyhow::bail!("--arg-db is required for analysis mode (or use --db-dir)");
     }
     if args.flanking_db.is_none() {
-        anyhow::bail!("--flanking-db is required for analysis mode");
+        anyhow::bail!("--flanking-db is required for analysis mode (or use --db-dir)");
+    }
+
+    // Auto-load the plasmid contig list from beside the flanking DB (enables the
+    // Context column by default). Looked up as plasmid_contigs.txt in the FDB's
+    // directory or its parent. --plasmid-contigs overrides this.
+    if args.plasmid_contigs.is_none() {
+        if let Some(fdb) = args.flanking_db.clone() {
+            let candidates = [
+                fdb.parent().map(|d| d.join("plasmid_contigs.txt")),
+                fdb.parent().and_then(|d| d.parent()).map(|d| d.join("plasmid_contigs.txt")),
+            ];
+            for cand in candidates.into_iter().flatten() {
+                if cand.exists() {
+                    if args.verbose { eprintln!("Auto-loaded plasmid list: {}", cand.display()); }
+                    args.plasmid_contigs = Some(cand);
+                    break;
+                }
+            }
+        }
+    }
+    // Auto-load contig→species map from beside the flanking DB (enables Species column).
+    if args.species_map.is_none() {
+        if let Some(fdb) = args.flanking_db.clone() {
+            let candidates = [
+                fdb.parent().map(|d| d.join("contig_species.tsv")),
+                fdb.parent().and_then(|d| d.parent()).map(|d| d.join("contig_species.tsv")),
+            ];
+            for cand in candidates.into_iter().flatten() {
+                if cand.exists() {
+                    if args.verbose { eprintln!("Auto-loaded species map: {}", cand.display()); }
+                    args.species_map = Some(cand);
+                    break;
+                }
+            }
+        }
     }
 
     // Auto-detect external tools
     args.minimap2 = find_executable("minimap2")?.to_string_lossy().to_string();
+
+    // --classify-contigs only needs minimap2 (detection + classification); skip the
+    // assembly/mapper toolchain and the read pipeline entirely.
+    if let Some(contigs_fa) = args.classify_contigs.clone() {
+        if args.verbose { eprintln!("Found minimap2: {}", args.minimap2); }
+        return run_classify_contigs_mode(&contigs_fa, &args);
+    }
+
     args.megahit = find_executable("megahit")?.to_string_lossy().to_string();
 
     if args.verbose {
         eprintln!("Found minimap2: {}", args.minimap2);
         eprintln!("Found megahit: {}", args.megahit);
+    }
+
+    // Resolve the read-filter mapper (Step 1). minimap2 is the default and keeps
+    // the original behaviour; strobealign/bwa-mem2 are opt-in and need a FASTA ref.
+    match args.mapper.as_str() {
+        "strobealign" => {
+            args.strobealign = match &args.strobealign_path {
+                Some(p) => p.to_string_lossy().to_string(),
+                None => find_executable("strobealign")?.to_string_lossy().to_string(),
+            };
+            args.ref_fasta_resolved = Some(resolve_ref_fasta(&args)?);
+            if args.verbose {
+                eprintln!("Found strobealign: {}", args.strobealign);
+                eprintln!("Mapper ref FASTA: {:?}", args.ref_fasta_resolved);
+            }
+        }
+        "bwa-mem2" => {
+            args.bwa_mem2 = match &args.bwa_mem2_path {
+                Some(p) => p.to_string_lossy().to_string(),
+                None => find_executable("bwa-mem2")?.to_string_lossy().to_string(),
+            };
+            let ref_fa = resolve_ref_fasta(&args)?;
+            // Build the index once up front so concurrent samples don't race on it.
+            ensure_bwamem2_index(&args.bwa_mem2, &ref_fa)?;
+            args.ref_fasta_resolved = Some(ref_fa);
+            if args.verbose {
+                eprintln!("Found bwa-mem2: {}", args.bwa_mem2);
+                eprintln!("Mapper ref FASTA: {:?}", args.ref_fasta_resolved);
+            }
+        }
+        _ => {}
     }
 
     // Configure rayon
@@ -1045,9 +1350,19 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
 
     // Step 1: Align and filter reads
     if args.verbose {
-        eprintln!("  [1/6] Aligning reads to ARG database...");
+        eprintln!("  [1/6] Aligning reads to ARG database (mapper: {})...", args.mapper);
     }
-    let paf_path = run_minimap2_reads(&sample.r1, &sample.r2, args.arg_db.as_ref().unwrap(), &sample_dir, &args.minimap2, args.threads)?;
+    let paf_path = match args.mapper.as_str() {
+        "strobealign" => run_strobealign_reads(
+            &sample.r1, &sample.r2,
+            args.ref_fasta_resolved.as_ref().unwrap(),
+            &sample_dir, &args.strobealign, args.paftools_path.as_deref(), args.threads)?,
+        "bwa-mem2" => run_bwamem2_reads(
+            &sample.r1, &sample.r2,
+            args.ref_fasta_resolved.as_ref().unwrap(),
+            &sample_dir, &args.bwa_mem2, args.paftools_path.as_deref(), args.threads)?,
+        _ => run_minimap2_reads(&sample.r1, &sample.r2, args.arg_db.as_ref().unwrap(), &sample_dir, &args.minimap2, args.threads)?,
+    };
     let matching_reads = parse_paf_filter(&paf_path, args.identity, args.min_align_len)?;
 
     if args.verbose {
@@ -1080,11 +1395,21 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         eprintln!("        Contigs assembled: {}", contigs.len());
     }
 
+    // Load the filtered reads ONCE and share them between the strict (Step 3) and
+    // flexible (Step 6) extension passes, avoiding a second full FASTQ load. Only
+    // when interior depth is NOT capped (cap-interior uses a different read subset
+    // for the strict pass, so it loads its own).
+    let shared_reads: Option<std::sync::Arc<Vec<String>>> = if args.cap_interior == 0 {
+        Some(ContigExtender::load_reads_shared(&filtered_r1, &filtered_r2)?)
+    } else {
+        None
+    };
+
     // Step 3: Strict extension (conservative, high confidence)
     if args.verbose {
         eprintln!("  [3/6] Extending contigs (strict)...");
     }
-    let mut strict_contigs = extend_contigs_strict(&contigs, &filtered_r1, &filtered_r2, &sample_dir, args)?;
+    let mut strict_contigs = extend_contigs_strict(&contigs, &filtered_r1, &filtered_r2, &sample_dir, args, shared_reads.clone())?;
 
     // Rename contigs for consistency (contig_1, contig_2, ...)
     // This ensures PAF query names match contig names in classify_genera
@@ -1154,7 +1479,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
 
         if !contigs_to_extend.is_empty() {
             // Apply Rust extension
-            let flexible_contigs = extend_contigs_flexible(&contigs_to_extend, &filtered_r1, &filtered_r2, &sample_dir, args)?;
+            let flexible_contigs = extend_contigs_flexible(&contigs_to_extend, &filtered_r1, &filtered_r2, &sample_dir, args, shared_reads.clone())?;
 
             // Re-classify with flexible contigs
             let flexible_genus = classify_genera(&unresolved_args.iter().map(|h| (*h).clone()).collect::<Vec<_>>(), &flexible_contigs, args)?;
@@ -1170,13 +1495,127 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         }
     }
 
+    // Step 6b: opt-in per-locus reassembly (v3 core/flank split) for STALLED loci.
+    // Targets loci with short flanking on both sides AND not already flagged
+    // plasmid (reassembly can't fix a mobile-element genus). Recovers a
+    // classifiable flanking so the 4-axis machinery can label these NA loci.
+    let mut reasm_results: HashMap<String, GenusResult> = HashMap::new();
+    if args.reassemble {
+        let contig_seq: HashMap<&str, &str> = strict_contigs.iter()
+            .map(|c| (c.name.as_str(), c.seq.as_str()))
+            .collect();
+        let mut stalled: Vec<reassemble::StalledLocus> = Vec::new();
+        for hit in &unique_args {
+            let gr = genus_results.iter()
+                .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig);
+            let short_flank = gr.map_or(true, |g| g.upstream_len < min_flanking_for_resolve
+                && g.downstream_len < min_flanking_for_resolve);
+            let is_plasmid = gr.map_or(false, |g| g.context == "plasmid");
+            if !short_flank || is_plasmid {
+                continue;
+            }
+            let cseq = match contig_seq.get(hit.contig.as_str()) {
+                Some(s) => *s,
+                None => continue,
+            };
+            let (s, e) = (hit.contig_start.min(cseq.len()), hit.contig_end.min(cseq.len()));
+            if e <= s {
+                continue;
+            }
+            stalled.push(reassemble::StalledLocus {
+                key: format!("{}:{}", hit.arg_name, hit.contig),
+                arg_name: hit.arg_name.clone(),
+                arg_class: hit.arg_class.clone(),
+                identity: hit.identity,
+                coverage: hit.coverage,
+                gene_seq: cseq[s..e].to_string(),
+                seed_seq: cseq.to_string(),
+            });
+        }
+        if !stalled.is_empty() {
+            if args.verbose {
+                eprintln!("  [6b] Reassembling {} stalled loci (core/flank split)...", stalled.len());
+            }
+            let spades_python = args.spades_python.clone().unwrap_or_else(|| {
+                args.spades_path.parent().map(|p| p.join("python3")).unwrap_or_default()
+            });
+            let cfg = reassemble::ReasmConfig {
+                minimap2: args.minimap2.clone(),
+                spades_py: args.spades_path.clone(),
+                spades_python,
+                threads: args.threads_per_sample.max(1),
+                core_cov: 0.70,
+                jobs: args.reassemble_jobs.max(1),
+            };
+            let workdir = sample_dir.join("reassemble");
+            match reassemble::reassemble_stalled(&stalled, &filtered_r1, &filtered_r2, &workdir, &cfg) {
+                Ok(stitched_loci) => {
+                    // Build ArgHits + FASTA for the stitched contigs, then re-classify.
+                    let mut recs: Vec<FastaRecord> = Vec::new();
+                    let mut hits: Vec<ArgHit> = Vec::new();
+                    for sl in &stitched_loci {
+                        for sc in &sl.contigs {
+                            recs.push(FastaRecord { name: sc.name.clone(), seq: sc.seq.clone() });
+                            hits.push(ArgHit {
+                                arg_name: sl.arg_name.clone(),
+                                arg_class: sl.arg_class.clone(),
+                                contig: sc.name.clone(),
+                                contig_len: sc.seq.len(),
+                                identity: sl.identity,
+                                coverage: sl.coverage,
+                                contig_start: sc.arg_start,
+                                contig_end: sc.arg_end,
+                                strand: '+',
+                            });
+                        }
+                    }
+                    if !recs.is_empty() {
+                        if let Ok(reclass) = classify_genera(&hits, &recs, args) {
+                            // Group re-classified stitched contigs back to their
+                            // original locus key; adopt the single best resolved
+                            // result per locus (conservative: only recovers a genus,
+                            // multi-genome nuance is noted but not merged).
+                            let mut per_locus: HashMap<String, Vec<GenusResult>> = HashMap::new();
+                            for r in reclass {
+                                // stitched name = "<key sanitized>__cN" -> recover locus via prefix match
+                                if let Some(sl) = stitched_loci.iter().find(|sl| {
+                                    r.contig_name.starts_with(&sl.key.replace([':', '|', ' '], "_"))
+                                }) {
+                                    per_locus.entry(sl.key.clone()).or_default().push(r);
+                                }
+                            }
+                            for (key, mut grs) in per_locus {
+                                // best = has genus, then most flanking
+                                grs.sort_by(|a, b| {
+                                    let fa = a.upstream_len + a.downstream_len;
+                                    let fb = b.upstream_len + b.downstream_len;
+                                    b.genus.is_some().cmp(&a.genus.is_some())
+                                        .then(fb.cmp(&fa))
+                                });
+                                if let Some(best) = grs.into_iter().next() {
+                                    reasm_results.insert(key, best);
+                                }
+                            }
+                        }
+                    }
+                    if args.verbose {
+                        eprintln!("        Reassembly resolved: {} loci", reasm_results.values().filter(|g| g.genus.is_some()).count());
+                    }
+                }
+                Err(e) => eprintln!("        (warning) reassembly failed: {}", e),
+            }
+        }
+    }
+
     // Build result rows with extension_method
     let results: Vec<ResultRow> = unique_args.iter()
         .map(|hit| {
             let key = format!("{}:{}", hit.arg_name, hit.contig);
 
-            // Check if flexible extension was used and successful
-            let (genus_info, ext_method) = if let Some(flex_result) = flexible_results.get(&key) {
+            // Precedence: reassembly (if it resolved a genus) > flexible > strict.
+            let (genus_info, ext_method) = if let Some(r) = reasm_results.get(&key).filter(|r| r.genus.is_some()) {
+                (r.clone(), "reassemble")
+            } else if let Some(flex_result) = flexible_results.get(&key) {
                 if flex_result.genus.is_some() {
                     (flex_result.clone(), "flexible")
                 } else {
@@ -1213,7 +1652,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                 contig_id: hit.contig.clone(),
                 arg_name: hit.arg_name.clone(),
                 arg_class: hit.arg_class.clone(),
-                genus: genus_info.genus.unwrap_or_else(|| "Unknown".to_string()),
+                genus: format_genus_call(&genus_info),
                 confidence: genus_info.confidence,
                 specificity,
                 identity: hit.identity,
@@ -1224,9 +1663,27 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                 extension_method: ext_method.to_string(),
                 top_matches: top_matches_str,
                 snp_status: format!("{}", genus_info.snp_status),
+                context: genus_info.context.clone(),
+                species: format_species_call(&genus_info),
             }
         })
         .collect();
+
+    // Per-locus outputs (opt-in via --emit-*): assembled gene/flank sequences per
+    // class, for inspection / BLAST / flanking-DB growth.
+    let emit_sel = EmitSel::resolve(args)?;
+    if emit_sel.on {
+        if let Err(e) = emit_locus_asm(&sample.name, &unique_args, &strict_contigs, &genus_results, &sample_dir, &emit_sel) {
+            eprintln!("        (warning) locus asm emit failed: {}", e);
+        }
+        if emit_sel.states.iter().any(|s| s == "reads") {
+            if let Err(e) = emit_locus_reads(&sample.name, &unique_args, &strict_contigs, &genus_results,
+                                             &filtered_r1, &filtered_r2, &sample_dir, &emit_sel, args) {
+                eprintln!("        (warning) locus reads emit failed: {}", e);
+            }
+        }
+        if args.verbose { eprintln!("        Per-locus outputs written ({} classes)", emit_sel.classes.len()); }
+    }
 
     Ok(results)
 }
@@ -1295,6 +1752,13 @@ fn classify_genera(
                     downstream_len,
                     top_matches: vec![("no_flanking_db".to_string(), 0.0)],
                     snp_status,
+                    upstream_seq: String::new(),
+                    downstream_seq: String::new(),
+                    context: "NA".to_string(),
+                    n_genera_tied: 0,
+                    species: None,
+                    species_top_matches: vec![],
+                    n_species_tied: 0,
                 }
             })
             .collect();
@@ -1307,16 +1771,21 @@ fn classify_genera(
     let mut classifier = GenusClassifier::new(
         args.flanking_db.as_ref().unwrap(),
         &args.minimap2,
-        0.90,  // min_identity: 90% to distinguish intra vs inter-genus
-        100,   // min_align_len: require decent overlap
+        args.genus_identity,  // min_identity to distinguish intra vs inter-genus
+        100,                  // min_align_len: require decent overlap
         args.max_flanking,
+        args.plasmid_contigs.as_deref(),
+        args.species_identity,
+        args.species_map.as_deref(),
+        args.context_plasmid_frac,
+        args.context_chromosome_frac,
     )?;
 
     classifier.classify_batch(&positions, args.threads)
 }
 
 fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
-    let header = "Sample\tContig_ID\tARG_Name\tARG_Class\tGenus\tConfidence\tSpecificity\tARG_Identity\tARG_Coverage\tContig_Len\tUpstream_Len\tDownstream_Len\tExtension_Method\tSNP_Status\tTop_Matches";
+    let header = "Sample\tContig_ID\tARG_Name\tARG_Class\tGenus\tSpecies\tConfidence\tSpecificity\tContext\tARG_Identity\tARG_Coverage\tContig_Len\tUpstream_Len\tDownstream_Len\tExtension_Method\tSNP_Status\tTop_Matches";
 
     // By default, filter out WildType and NotCovered (not true resistance genes)
     // WildType: SNP position checked but found wild-type allele (no resistance mutation)
@@ -1341,14 +1810,16 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
     for r in &output_results {
         writeln!(
             output,
-            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
             r.sample,
             r.contig_id,
             r.arg_name,
             r.arg_class,
             r.genus,
+            r.species,
             r.confidence,
             r.specificity,
+            r.context,
             r.identity,
             r.coverage,
             r.contig_len,
@@ -1374,12 +1845,125 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
 }
 
 /// Strict extension (conservative, high confidence) - uses exact k-mer matching
+/// Positionally cap read depth in contig interiors before extension.
+///
+/// The k-mer extender only ever uses reads that match a contig's EDGE k-mers, so
+/// reads mapping deep in the interior (>= `end_zone` bp from both ends) are dead
+/// weight — loaded into RAM and scanned every iteration for nothing. This maps the
+/// reads to the contigs and drops interior reads once local coverage exceeds `cap`,
+/// while keeping every terminal-zone and unmapped read (extension/flanking fuel).
+/// Deterministic: alignments are processed in a fixed sort order.
+fn cap_interior_reads(
+    contigs: &[FastaRecord],
+    r1: &Path,
+    r2: &Path,
+    sample_dir: &Path,
+    cap: usize,
+    end_zone: usize,
+    minimap2: &str,
+    threads: usize,
+) -> Result<(PathBuf, PathBuf)> {
+    let contigs_fa = sample_dir.join("cap_contigs.fa");
+    write_contigs_simple(contigs, &contigs_fa)?;
+
+    // Build the set of interior reads to DROP for one read file.
+    let build_drop_set = |reads: &Path, tag: &str| -> Result<FxHashSet<String>> {
+        let paf = sample_dir.join(format!("cap_{}.paf", tag));
+        let status = Command::new(minimap2)
+            .args(["-x", "sr", "-t", &threads.to_string()])
+            .arg(&contigs_fa)
+            .arg(reads)
+            .arg("-o")
+            .arg(&paf)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("Failed to run minimap2 for interior cap")?;
+        if !status.success() {
+            anyhow::bail!("minimap2 (interior cap) exited with {:?}", status.code());
+        }
+
+        // Best alignment per read (by matches), plus classify interior vs terminal.
+        // best: read -> (matches, target, target_len, tstart, tend)
+        let mut best: HashMap<String, (usize, String, usize, usize, usize)> = HashMap::new();
+        let reader = PafReader::open(&paf)?;
+        for rec in reader {
+            let r = rec?;
+            let e = best.get(&r.query_name);
+            if e.map_or(true, |(m, ..)| r.matches > *m) {
+                best.insert(
+                    r.query_name.clone(),
+                    (r.matches, r.target_name, r.target_len, r.target_start, r.target_end),
+                );
+            }
+        }
+
+        // Interior reads only, sorted deterministically by (contig, start, read).
+        let mut interior: Vec<(&str, usize, usize, &str)> = Vec::new(); // (contig, s, e, read)
+        for (read, (_m, contig, tlen, ts, te)) in best.iter() {
+            let is_terminal = *ts < end_zone || *te + end_zone > *tlen;
+            if !is_terminal {
+                interior.push((contig.as_str(), *ts, *te, read.as_str()));
+            }
+        }
+        interior.sort_unstable();
+
+        // Per-contig coverage cap: keep a read only if some base it covers is still
+        // below `cap`; otherwise drop it.
+        let mut cov: HashMap<&str, Vec<u16>> = HashMap::new();
+        let mut drop_set = FxHashSet::default();
+        let capv = cap as u16;
+        for (contig, s, e, read) in interior {
+            let tlen = best[read].2;
+            let arr = cov.entry(contig).or_insert_with(|| vec![0u16; tlen]);
+            let end = e.min(arr.len());
+            let mut under = false;
+            for c in &arr[s..end] {
+                if *c < capv { under = true; break; }
+            }
+            if under {
+                for c in &mut arr[s..end] { *c = c.saturating_add(1); }
+            } else {
+                drop_set.insert(read.to_string());
+            }
+        }
+        Ok(drop_set)
+    };
+
+    let write_kept = |reads: &Path, drop_set: &FxHashSet<String>, out: &Path| -> Result<(usize, usize)> {
+        let mut reader = FastqFile::open(reads)?;
+        let mut w = BufWriter::new(File::create(out)?);
+        let (mut kept, mut total) = (0usize, 0usize);
+        while let Some(rec) = reader.read_next()? {
+            total += 1;
+            if !drop_set.contains(&rec.name) {
+                writeln!(w, "@{}\n{}\n+\n{}", rec.name, rec.seq, rec.qual)?;
+                kept += 1;
+            }
+        }
+        Ok((kept, total))
+    };
+
+    let drop1 = build_drop_set(r1, "r1")?;
+    let drop2 = build_drop_set(r2, "r2")?;
+    let out_r1 = sample_dir.join("capped_R1.fq");
+    let out_r2 = sample_dir.join("capped_R2.fq");
+    let (k1, t1) = write_kept(r1, &drop1, &out_r1)?;
+    let (k2, t2) = write_kept(r2, &drop2, &out_r2)?;
+    eprintln!(
+        "        Interior cap ({}x, end-zone {}bp): kept {}/{} reads ({:.0}%)",
+        cap, end_zone, k1 + k2, t1 + t2,
+        (k1 + k2) as f64 / (t1 + t2).max(1) as f64 * 100.0
+    );
+    Ok((out_r1, out_r2))
+}
+
 fn extend_contigs_strict(
     contigs: &[FastaRecord],
     r1: &Path,
     r2: &Path,
     sample_dir: &Path,
     args: &Args,
+    shared_reads: Option<std::sync::Arc<Vec<String>>>,
 ) -> Result<Vec<FastaRecord>> {
     // Strict mode: higher coverage requirement, lower branching tolerance
     let config = ExtenderConfig {
@@ -1388,11 +1972,32 @@ fn extend_contigs_strict(
         min_coverage: 3,
         branching_threshold: 0.1,
         max_n_ratio: 0.02,
+        // Only ~max_flanking bp of flanking is ever used downstream; cap each side
+        // (with margin) so runaway contigs don't burn many extra re-scan rounds.
+        max_extension_per_side: if args.max_extension > 0 { args.max_extension } else { (args.max_flanking * 2).max(1500) },
         ..Default::default()
     };
 
+    // Optionally cap interior read depth to shrink the extender's memory use.
+    let (cap_r1, cap_r2);
+    let (r1, r2) = if args.cap_interior > 0 {
+        let (a, b) = cap_interior_reads(
+            contigs, r1, r2, sample_dir,
+            args.cap_interior, args.end_zone, &args.minimap2, args.threads,
+        )?;
+        cap_r1 = a; cap_r2 = b;
+        (cap_r1.as_path(), cap_r2.as_path())
+    } else {
+        (r1, r2)
+    };
+
     let mut extender = ContigExtender::new(config);
-    extender.load_reads(r1, r2)?;
+    // Reuse the pre-loaded reads when interior wasn't capped (same read set);
+    // otherwise load the (capped) reads for this pass.
+    match (&shared_reads, args.cap_interior) {
+        (Some(reads), 0) => extender.set_reads(reads.clone()),
+        _ => extender.load_reads(r1, r2)?,
+    }
 
     let results = extender.extend_all_hybrid(contigs)?;
 
@@ -1411,6 +2016,7 @@ fn extend_contigs_flexible(
     r2: &Path,
     sample_dir: &Path,
     args: &Args,
+    shared_reads: Option<std::sync::Arc<Vec<String>>>,
 ) -> Result<Vec<FastaRecord>> {
     // Flexible mode: lower coverage, higher branching tolerance
     let config = ExtenderConfig {
@@ -1419,11 +2025,16 @@ fn extend_contigs_flexible(
         min_coverage: 2,
         branching_threshold: 0.2,
         max_n_ratio: 0.05,
+        max_extension_per_side: if args.max_extension > 0 { args.max_extension } else { (args.max_flanking * 2).max(1500) },
         ..Default::default()
     };
 
     let mut extender = ContigExtender::new(config);
-    extender.load_reads(r1, r2)?;
+    // Reuse the pre-loaded reads (flexible always uses the full filtered set).
+    match &shared_reads {
+        Some(reads) => extender.set_reads(reads.clone()),
+        None => extender.load_reads(r1, r2)?,
+    }
 
     let results = extender.extend_all_hybrid(contigs)?;
 
@@ -1489,6 +2100,307 @@ fn run_minimap2_reads(r1: &Path, r2: &Path, db: &Path, output_dir: &Path, minima
     }
 
     Ok(paf_merged)
+}
+
+/// Derive a FASTA reference for strobealign/bwa-mem2 from --ref-fasta, or by
+/// swapping a .mmi extension on --arg-db for a sibling .fa/.fas/.fasta.
+/// First regular file in `dir` whose extension matches one of `exts` (sorted for
+/// deterministic pick). Used by --db-dir discovery.
+fn find_db_file(dir: &Path, exts: &[&str]) -> Option<PathBuf> {
+    let mut hits: Vec<PathBuf> = fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .filter(|p| p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
+            .unwrap_or(false))
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
+/// Locate the flanking DB in `dir`: a `flanking.fdb` file, any `*.fdb` file, or a
+/// `*.fdb/` directory containing `flanking.fdb`.
+fn find_flanking_db(dir: &Path) -> Option<PathBuf> {
+    let direct = dir.join("flanking.fdb");
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if let Some(f) = find_db_file(dir, &["fdb"]) {
+        return Some(f);
+    }
+    // A `*.fdb/` directory (the builder's layout) with flanking.fdb inside.
+    let mut subdirs: Vec<PathBuf> = fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir() && p.extension().and_then(|e| e.to_str()) == Some("fdb"))
+        .collect();
+    subdirs.sort();
+    for sd in subdirs {
+        let inner = sd.join("flanking.fdb");
+        if inner.is_file() {
+            return Some(inner);
+        }
+    }
+    None
+}
+
+/// True if `p` names a FASTA (optionally gzip-compressed): *.fa/.fas/.fasta/.fna,
+/// optionally with a trailing .gz. minimap2 and strobealign both read gzipped FASTA.
+fn is_fasta_path(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    let base = name.strip_suffix(".gz").unwrap_or(&name);
+    [".fa", ".fas", ".fasta", ".fna"].iter().any(|e| base.ends_with(e))
+}
+
+/// First FASTA (plain or .gz) in `dir`, sorted for a deterministic pick.
+fn find_fasta_file(dir: &Path) -> Option<PathBuf> {
+    let mut hits: Vec<PathBuf> = fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && is_fasta_path(p))
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
+fn resolve_ref_fasta(args: &Args) -> Result<PathBuf> {
+    if let Some(p) = &args.ref_fasta {
+        if p.exists() {
+            return Ok(p.clone());
+        }
+        anyhow::bail!("--ref-fasta does not exist: {:?}", p);
+    }
+    if let Some(db) = &args.arg_db {
+        // (a) --arg-db is itself a FASTA (plain or .gz): use it directly.
+        if is_fasta_path(db) && db.exists() {
+            return Ok(db.clone());
+        }
+        // (b) derive from a .mmi (etc.) stem: AMR_PanRes.mmi -> AMR_PanRes.fa[.gz]
+        let stem = db.with_extension("");
+        for ext in ["fa", "fas", "fasta", "fna", "fa.gz", "fas.gz", "fasta.gz", "fna.gz"] {
+            let cand = PathBuf::from(format!("{}.{}", stem.display(), ext));
+            if cand.exists() {
+                return Ok(cand);
+            }
+        }
+    }
+    anyhow::bail!(
+        "--mapper {} needs a FASTA reference. Provide --ref-fasta <FILE> \
+         (strobealign/bwa-mem2 cannot read a minimap2 .mmi).",
+        args.mapper
+    );
+}
+
+/// Ensure bwa-mem2 index sidecar files exist next to `fasta`; build once if not.
+fn ensure_bwamem2_index(bwa_mem2: &str, fasta: &Path) -> Result<()> {
+    let marker = PathBuf::from(format!("{}.bwt.2bit.64", fasta.display()));
+    if marker.exists() {
+        return Ok(());
+    }
+    let output = Command::new(bwa_mem2)
+        .arg("index")
+        .arg(fasta)
+        .output()
+        .context("Failed to run bwa-mem2 index")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "bwa-mem2 index failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Read filter using strobealign (paired). Emits SAM, converts to PAF, returns PAF path.
+/// The PAF is semantically identical to minimap2's (matches/block_len), so the
+/// existing parse_paf_filter contract holds unchanged.
+fn run_strobealign_reads(
+    r1: &Path, r2: &Path, ref_fasta: &Path, output_dir: &Path,
+    strobealign: &str, paftools: Option<&Path>, threads: usize,
+) -> Result<PathBuf> {
+    let sam_path = output_dir.join("alignment.sam");
+    let paf_path = output_dir.join("alignment.paf");
+
+    let sam_file = File::create(&sam_path)?;
+    let status = Command::new(strobealign)
+        .args(["-t", &threads.to_string()])
+        .arg(ref_fasta).arg(r1).arg(r2)
+        .stdout(std::process::Stdio::from(sam_file))
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("Failed to run strobealign")?;
+    if !status.success() {
+        anyhow::bail!("strobealign exited with status {:?}", status.code());
+    }
+
+    convert_sam_to_paf(&sam_path, &paf_path, paftools)?;
+    Ok(paf_path)
+}
+
+/// Read filter using bwa-mem2 (paired). Emits SAM, converts to PAF, returns PAF path.
+fn run_bwamem2_reads(
+    r1: &Path, r2: &Path, ref_fasta: &Path, output_dir: &Path,
+    bwa_mem2: &str, paftools: Option<&Path>, threads: usize,
+) -> Result<PathBuf> {
+    let sam_path = output_dir.join("alignment.sam");
+    let paf_path = output_dir.join("alignment.paf");
+
+    ensure_bwamem2_index(bwa_mem2, ref_fasta)?;
+
+    let sam_file = File::create(&sam_path)?;
+    let status = Command::new(bwa_mem2)
+        .arg("mem")
+        .args(["-t", &threads.to_string()])
+        .arg(ref_fasta).arg(r1).arg(r2)
+        .stdout(std::process::Stdio::from(sam_file))
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("Failed to run bwa-mem2 mem")?;
+    if !status.success() {
+        anyhow::bail!("bwa-mem2 mem exited with status {:?}", status.code());
+    }
+
+    convert_sam_to_paf(&sam_path, &paf_path, paftools)?;
+    Ok(paf_path)
+}
+
+/// Convert SAM to PAF. Uses paftools.sh sam2paf when a path is given, otherwise a
+/// built-in converter with identical identity/block-length semantics.
+fn convert_sam_to_paf(sam: &Path, paf: &Path, paftools: Option<&Path>) -> Result<()> {
+    if let Some(pt) = paftools {
+        let out = File::create(paf)?;
+        let status = Command::new(pt)
+            .arg("sam2paf")
+            .arg(sam)
+            .stdout(std::process::Stdio::from(out))
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("Failed to run paftools.sh sam2paf")?;
+        if status.success() {
+            return Ok(());
+        }
+        eprintln!("paftools.sh sam2paf failed; falling back to built-in converter");
+    }
+    sam_to_paf_builtin(sam, paf)
+}
+
+/// Built-in SAM->PAF converter.
+///
+/// Mirrors `paftools.sh sam2paf` for the fields the read filter consumes:
+///   block_len (col 11) = sum of CIGAR M/I/D/=/X   (aligned columns + indels)
+///   matches   (col 10) = aligned columns (M/=/X) - mismatches,
+///                        where mismatches = NM - (inserted + deleted bases)
+/// so parse_paf_filter's identity = matches/block_len matches minimap2 exactly.
+/// Records without an alignment (FLAG 0x4) or without an NM tag are skipped.
+fn sam_to_paf_builtin(sam: &Path, paf: &Path) -> Result<()> {
+    let reader = BufReader::with_capacity(1 << 20, File::open(sam)?);
+    let mut writer = BufWriter::new(File::create(paf)?);
+    // Reference lengths from @SQ headers (SN -> LN).
+    let mut ref_len: HashMap<String, usize> = HashMap::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('@') {
+            if let Some(rest) = line.strip_prefix("@SQ\t") {
+                let mut sn = None;
+                let mut ln = None;
+                for f in rest.split('\t') {
+                    if let Some(v) = f.strip_prefix("SN:") { sn = Some(v.to_string()); }
+                    else if let Some(v) = f.strip_prefix("LN:") { ln = v.parse::<usize>().ok(); }
+                }
+                if let (Some(sn), Some(ln)) = (sn, ln) {
+                    ref_len.insert(sn, ln);
+                }
+            }
+            continue;
+        }
+
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 11 {
+            continue;
+        }
+        let flag: u32 = f[1].parse().unwrap_or(0);
+        if flag & 0x4 != 0 {
+            continue; // unmapped
+        }
+        let cigar = f[5];
+        if cigar == "*" {
+            continue;
+        }
+        // NM tag (edit distance) from optional fields.
+        let mut nm: Option<i64> = None;
+        for tag in &f[11..] {
+            if let Some(v) = tag.strip_prefix("NM:i:") {
+                nm = v.parse::<i64>().ok();
+                break;
+            }
+        }
+        let nm = match nm {
+            Some(v) => v,
+            None => continue, // cannot compute identity without NM
+        };
+
+        // Walk the CIGAR.
+        let (mut m_ops, mut ins, mut del): (i64, i64, i64) = (0, 0, 0);
+        let (mut q_lead_clip, mut q_trail_clip): (usize, usize) = (0, 0);
+        let mut ref_consumed: usize = 0;
+        let mut num = 0usize;
+        let mut seen_aln = false;
+        let bytes = cigar.as_bytes();
+        for &b in bytes {
+            if b.is_ascii_digit() {
+                num = num * 10 + (b - b'0') as usize;
+            } else {
+                match b {
+                    b'M' | b'=' | b'X' => { m_ops += num as i64; ref_consumed += num; seen_aln = true; }
+                    b'I' => { ins += num as i64; seen_aln = true; }
+                    b'D' | b'N' => { del += num as i64; ref_consumed += num; seen_aln = true; }
+                    b'S' | b'H' => {
+                        if seen_aln { q_trail_clip = num; } else { q_lead_clip = num; }
+                    }
+                    _ => {}
+                }
+                num = 0;
+            }
+        }
+
+        let block_len = m_ops + ins + del;
+        if block_len <= 0 {
+            continue;
+        }
+        let mismatches = nm - (ins + del);
+        let matches = (m_ops - mismatches).max(0);
+
+        let qname = f[0];
+        let strand = if flag & 0x10 != 0 { '-' } else { '+' };
+        let rname = f[2];
+        let pos: usize = f[3].parse::<usize>().unwrap_or(1);
+        let mapq: &str = f[4];
+        let t_start = pos.saturating_sub(1);
+        let t_end = t_start + ref_consumed;
+        let t_len = ref_len.get(rname).copied().unwrap_or(t_end.max(1));
+
+        // Query coordinates on the forward read (soft/hard clips define the span).
+        let q_aln_len = (m_ops + ins) as usize;
+        let q_len = q_lead_clip + q_aln_len + q_trail_clip;
+        // PAF query coords are on the original (forward) read.
+        let (q_start, q_end) = if strand == '+' {
+            (q_lead_clip, q_lead_clip + q_aln_len)
+        } else {
+            (q_trail_clip, q_trail_clip + q_aln_len)
+        };
+
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            qname, q_len.max(1), q_start, q_end, strand,
+            rname, t_len, t_start, t_end, matches, block_len, mapq
+        )?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 fn parse_paf_filter(paf_path: &Path, min_identity: f64, min_align_len: usize) -> Result<FxHashSet<String>> {
@@ -1601,6 +2513,363 @@ fn write_contigs_simple(contigs: &[FastaRecord], path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reverse-complement a DNA string (non-ACGT mapped to N).
+fn revcomp_str(seq: &str) -> String {
+    seq.chars().rev().map(|c| match c.to_ascii_uppercase() {
+        'A' => 'T', 'T' => 'A', 'G' => 'C', 'C' => 'G', _ => 'N',
+    }).collect()
+}
+
+/// Selection of per-locus outputs to emit (cross-product of class × part × state).
+struct EmitSel {
+    on: bool,
+    classes: Vec<String>,
+    parts: Vec<String>,
+    states: Vec<String>,
+}
+
+impl EmitSel {
+    fn resolve(args: &Args) -> Result<Self> {
+        let on = !args.emit_class.is_empty() || !args.emit_part.is_empty() || !args.emit_state.is_empty();
+        let norm = |v: &[String], allowed: &[&str], name: &str| -> Result<Vec<String>> {
+            if v.is_empty() { return Ok(allowed.iter().map(|s| s.to_string()).collect()); }
+            for x in v {
+                if !allowed.contains(&x.as_str()) {
+                    anyhow::bail!("invalid --emit-{} value '{}' (allowed: {})", name, x, allowed.join(", "));
+                }
+            }
+            Ok(v.to_vec())
+        };
+        Ok(EmitSel {
+            on,
+            classes: norm(&args.emit_class, &["resolved", "flanknomatch", "genenotindb"], "class")?,
+            parts: norm(&args.emit_part, &["gene", "flank"], "part")?,
+            states: norm(&args.emit_state, &["asm", "reads"], "state")?,
+        })
+    }
+    fn wants(&self, class: &str, part: &str, state: &str) -> bool {
+        self.on
+            && self.classes.iter().any(|c| c == class)
+            && self.parts.iter().any(|p| p == part)
+            && self.states.iter().any(|s| s == state)
+    }
+}
+
+/// Flanking-DB outcome class for a locus.
+fn locus_class(res: &GenusResult) -> &'static str {
+    if res.genus.is_some() {
+        "resolved"
+    } else if res.top_matches.first().map(|(g, _)| g == "gene_not_in_db").unwrap_or(false) {
+        "genenotindb"
+    } else {
+        "flanknomatch"
+    }
+}
+
+/// Placeholder for an absent header field (chosen so R/pandas read it as missing).
+const NA: &str = "NA";
+
+/// `flankdb` header field: DB match info when present, else why not.
+fn flankdb_field(res: &GenusResult) -> String {
+    match locus_class(res) {
+        "resolved" => res.top_matches.first().map(|(g, s)| format!("{}:{:.1}", g, s)).unwrap_or_else(|| NA.to_string()),
+        "genenotindb" => "gene_absent".to_string(),
+        _ => "no_match".to_string(),
+    }
+}
+
+/// Uniform 12-column, `|`-delimited FASTA header (TSV-friendly; "." = NA).
+/// Columns: sample|contig|part|arg|argclass|pct_id|pct_cov|region|flank_len|genus|flankdb|read
+#[allow(clippy::too_many_arguments)]
+fn locus_hdr(sample: &str, contig: &str, part: &str, arg: &str, argclass: &str,
+             pct_id: &str, pct_cov: &str, region: &str, flank_len: &str,
+             genus: &str, flankdb: &str, read: &str) -> String {
+    format!(">{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            sample, contig, part, arg, argclass, pct_id, pct_cov, region, flank_len, genus, flankdb, read)
+}
+
+const LOCUS_COLUMNS: &str = "sample\tcontig\tpart\targ\targclass\tpct_id\tpct_cov\tregion\tflank_len\tgenus\tflankdb\tread";
+
+/// Emit per-locus FASTA outputs (assembled gene/flank sequences) for the selected
+/// class × part × state combinations. Uses the given classification results and the
+/// contigs they were called on so gene and flanking share one coordinate frame.
+/// DB-redundant duplicates on the same contig region are collapsed. Read-state
+/// outputs are produced separately by `emit_locus_reads`.
+fn emit_locus_asm(
+    sample_name: &str,
+    arg_hits: &[ArgHit],
+    contigs: &[FastaRecord],
+    results: &[GenusResult],
+    sample_dir: &Path,
+    sel: &EmitSel,
+) -> Result<()> {
+    const MIN_FLANK: usize = 50;
+    let contig_map: HashMap<&str, &str> = contigs.iter()
+        .map(|c| (c.name.split_whitespace().next().unwrap_or(&c.name), c.seq.as_str()))
+        .collect();
+
+    // Open only the selected {class}.{part}.asm files.
+    let mut files: HashMap<(String, String), BufWriter<File>> = HashMap::new();
+    for class in &sel.classes {
+        for part in &sel.parts {
+            if sel.wants(class, part, "asm") {
+                let path = sample_dir.join(format!("{}.{}.asm.fasta", class, part));
+                files.insert((class.clone(), part.clone()), BufWriter::new(File::create(path)?));
+            }
+        }
+    }
+    // Column-schema sidecar.
+    if sel.on {
+        let mut c = BufWriter::new(File::create(sample_dir.join("loci_outputs.columns.tsv"))?);
+        writeln!(c, "{}", LOCUS_COLUMNS)?;
+    }
+    if files.is_empty() { return Ok(()); }
+
+    let mut seen: std::collections::HashSet<(String, usize, usize)> = std::collections::HashSet::new();
+    for hit in arg_hits {
+        let res = match results.iter().find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig) {
+            Some(r) => r, None => continue,
+        };
+        let class = locus_class(res).to_string();
+        if !sel.classes.iter().any(|c| *c == class) { continue; }
+
+        let contig_key = hit.contig.split_whitespace().next().unwrap_or(&hit.contig);
+        if !seen.insert((contig_key.to_string(), hit.contig_start, hit.contig_end)) { continue; }
+
+        let genus = res.genus.clone().unwrap_or_else(|| NA.to_string());
+        let flankdb = flankdb_field(res);
+
+        // gene part
+        if let Some(w) = files.get_mut(&(class.clone(), "gene".to_string())) {
+            if let Some(cseq) = contig_map.get(contig_key) {
+                let (s, e) = (hit.contig_start.min(cseq.len()), hit.contig_end.min(cseq.len()));
+                if e > s {
+                    let mut gene = cseq[s..e].to_string();
+                    if hit.strand == '-' { gene = revcomp_str(&gene); }
+                    let hdr = locus_hdr(sample_name, contig_key, "gene", &hit.arg_name, &hit.arg_class,
+                                        &format!("{:.1}", hit.identity), &format!("{:.1}", hit.coverage),
+                                        &format!("{}-{}", s, e), NA, &genus, NA, NA);
+                    writeln!(w, "{}\n{}", hdr, gene)?;
+                }
+            }
+        }
+        // flank part (upstream + downstream)
+        if let Some(w) = files.get_mut(&(class.clone(), "flank".to_string())) {
+            if res.upstream_seq.len() >= MIN_FLANK {
+                let hdr = locus_hdr(sample_name, contig_key, "flank_up", &hit.arg_name, &hit.arg_class,
+                                    NA, NA, NA, &res.upstream_seq.len().to_string(), &genus, &flankdb, NA);
+                writeln!(w, "{}\n{}", hdr, res.upstream_seq)?;
+            }
+            if res.downstream_seq.len() >= MIN_FLANK {
+                let hdr = locus_hdr(sample_name, contig_key, "flank_down", &hit.arg_name, &hit.arg_class,
+                                    NA, NA, NA, &res.downstream_seq.len().to_string(), &genus, &flankdb, NA);
+                writeln!(w, "{}\n{}", hdr, res.downstream_seq)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-locus zone on a contig used to bin mapped reads.
+struct LocusZone {
+    gene: (usize, usize),
+    up: (usize, usize),
+    down: (usize, usize),
+    arg: String,
+    argclass: String,
+    class: String,
+    genus: String,
+    flankdb: String,
+}
+
+/// Emit reads-state per-locus outputs: map filtered reads to the contigs, bin each
+/// read by the region it overlaps (gene vs flanking; overlap-both → flank), and write
+/// the read sequences with the uniform header. Uses minimap2 `-a` so read sequences
+/// come straight from the SAM (no fastq re-streaming).
+#[allow(clippy::too_many_arguments)]
+fn emit_locus_reads(
+    sample_name: &str,
+    arg_hits: &[ArgHit],
+    contigs: &[FastaRecord],
+    results: &[GenusResult],
+    r1: &Path,
+    r2: &Path,
+    sample_dir: &Path,
+    sel: &EmitSel,
+    args: &Args,
+) -> Result<()> {
+    // Open selected {class}.{part}.reads files.
+    let mut files: HashMap<(String, String), BufWriter<File>> = HashMap::new();
+    for class in &sel.classes {
+        for part in &sel.parts {
+            if sel.wants(class, part, "reads") {
+                let path = sample_dir.join(format!("{}.{}.reads.fasta", class, part));
+                files.insert((class.clone(), part.clone()), BufWriter::new(File::create(path)?));
+            }
+        }
+    }
+    if files.is_empty() { return Ok(()); }
+
+    let clen: HashMap<&str, usize> = contigs.iter()
+        .map(|c| (c.name.split_whitespace().next().unwrap_or(&c.name), c.seq.len())).collect();
+
+    // Build per-contig zones for selected classes (dedup by contig region).
+    let maxf = args.max_flanking;
+    let mut zones: HashMap<String, Vec<LocusZone>> = HashMap::new();
+    let mut seen: std::collections::HashSet<(String, usize, usize)> = std::collections::HashSet::new();
+    for hit in arg_hits {
+        let res = match results.iter().find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig) {
+            Some(r) => r, None => continue,
+        };
+        let class = locus_class(res).to_string();
+        if !sel.classes.iter().any(|c| *c == class) { continue; }
+        let ckey = hit.contig.split_whitespace().next().unwrap_or(&hit.contig).to_string();
+        if !seen.insert((ckey.clone(), hit.contig_start, hit.contig_end)) { continue; }
+        let cl = *clen.get(ckey.as_str()).unwrap_or(&0);
+        let (s, e) = (hit.contig_start.min(cl), hit.contig_end.min(cl));
+        zones.entry(ckey).or_default().push(LocusZone {
+            gene: (s, e),
+            up: (s.saturating_sub(maxf), s),
+            down: (e, (e + maxf).min(cl)),
+            arg: hit.arg_name.clone(),
+            argclass: hit.arg_class.clone(),
+            class,
+            genus: res.genus.clone().unwrap_or_else(|| NA.to_string()),
+            flankdb: flankdb_field(res),
+        });
+    }
+    if zones.is_empty() { return Ok(()); }
+
+    // Map filtered reads to the contigs (SAM has the read sequences).
+    let contigs_fa = sample_dir.join("emit_reads_contigs.fasta");
+    write_contigs_simple(contigs, &contigs_fa)?;
+    let sam_path = sample_dir.join("emit_reads.sam");
+    let sam_file = File::create(&sam_path)?;
+    Command::new(&args.minimap2)
+        .args(["-a", "-x", "sr", "-t", &args.threads.to_string()])
+        .arg(&contigs_fa).arg(r1).arg(r2)
+        .stdout(std::process::Stdio::from(sam_file))
+        .stderr(std::process::Stdio::null())
+        .status().context("minimap2 read->contig mapping failed")?;
+
+    let ovl = |a: (usize, usize), rs: usize, re: usize| a.1 > a.0 && rs.max(a.0) < re.min(a.1);
+    let reader = std::io::BufReader::new(File::open(&sam_path)?);
+    for line in reader.lines() {
+        let line = line?;
+        if line.starts_with('@') { continue; }
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() < 11 { continue; }
+        let (rname, seq) = (c[2], c[9]);
+        if rname == "*" || seq == "*" || seq.is_empty() { continue; }
+        let pos: usize = match c[3].parse::<usize>() { Ok(p) if p > 0 => p - 1, _ => continue };
+        let (rs, re) = (pos, pos + seq.len());
+        let locs = match zones.get(rname) { Some(v) => v, None => continue };
+        for z in locs {
+            // Overlap-both → flank; check flanks first.
+            let (part_dim, part_lbl) = if ovl(z.up, rs, re) {
+                ("flank", "flank_up")
+            } else if ovl(z.down, rs, re) {
+                ("flank", "flank_down")
+            } else if ovl(z.gene, rs, re) {
+                ("gene", "gene")
+            } else { continue };
+            if let Some(w) = files.get_mut(&(z.class.clone(), part_dim.to_string())) {
+                let hdr = locus_hdr(sample_name, rname, part_lbl, &z.arg, &z.argclass,
+                                    NA, NA, NA, NA, &z.genus, &z.flankdb, c[0]);
+                writeln!(w, "{}\n{}", hdr, seq)?;
+            }
+            break; // assign each read to one locus
+        }
+    }
+    let _ = fs::remove_file(&contigs_fa);
+    let _ = fs::remove_file(&sam_path);
+    Ok(())
+}
+
+/// Classify a pre-assembled contig FASTA: ARG detection + genus classification +
+/// unresolved exports, without the read-filter/assembly stages. Used to A/B-test
+/// alternative assemblies (e.g. per-locus reassembly) against the baseline.
+fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
+    let sample_name = contigs_fa.file_stem().and_then(|s| s.to_str()).unwrap_or("classify").to_string();
+    let sample_dir = args.outdir.join(&sample_name);
+    fs::create_dir_all(&sample_dir)?;
+
+    if args.verbose {
+        eprintln!("[classify-contigs] Loading {}", contigs_fa.display());
+    }
+    let contigs = load_and_filter_contigs(contigs_fa, args.min_contig_len)?;
+    if contigs.is_empty() {
+        anyhow::bail!("No contigs >= {} bp in {}", args.min_contig_len, contigs_fa.display());
+    }
+    if args.verbose {
+        eprintln!("[classify-contigs] {} contigs; detecting ARGs...", contigs.len());
+    }
+
+    let contigs_path = sample_dir.join("contigs_input.fasta");
+    write_contigs_simple(&contigs, &contigs_path)?;
+
+    let paf_contigs = run_minimap2_contigs(&contigs_path, args.arg_db.as_ref().unwrap(), &sample_dir, &args.minimap2, args.threads)?;
+    let arg_hits = detect_args(&paf_contigs, args.arg_identity, args.arg_coverage)?;
+    let unique_args = deduplicate_args(arg_hits);
+    if args.verbose {
+        eprintln!("[classify-contigs] ARGs detected: {}", unique_args.len());
+    }
+    if unique_args.is_empty() {
+        output_results(&[], args)?;
+        return Ok(());
+    }
+
+    let genus_results = classify_genera(&unique_args, &contigs, args)?;
+
+    let results: Vec<ResultRow> = unique_args.iter().map(|hit| {
+        let g = genus_results.iter()
+            .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig)
+            .cloned().unwrap_or_default();
+        let top_matches_str = g.top_matches.iter()
+            .map(|(gg, s)| format!("{}:{:.1}", gg, s)).collect::<Vec<_>>().join(";");
+        let specificity = if g.specificity <= 1.0 { g.specificity * 100.0 } else { g.specificity };
+        let genus_call = format_genus_call(&g);
+        let species_call = format_species_call(&g);
+        ResultRow {
+            sample: sample_name.clone(),
+            contig_id: hit.contig.clone(),
+            arg_name: hit.arg_name.clone(),
+            arg_class: hit.arg_class.clone(),
+            genus: genus_call,
+            confidence: g.confidence,
+            specificity,
+            identity: hit.identity,
+            coverage: hit.coverage,
+            contig_len: hit.contig_len,
+            upstream_len: g.upstream_len,
+            downstream_len: g.downstream_len,
+            extension_method: "classify".to_string(),
+            top_matches: top_matches_str,
+            snp_status: format!("{}", g.snp_status),
+            context: g.context.clone(),
+            species: species_call,
+        }
+    }).collect();
+
+    let emit_sel = EmitSel::resolve(args)?;
+    if emit_sel.on {
+        if let Err(e) = emit_locus_asm(&sample_name, &unique_args, &contigs, &genus_results, &sample_dir, &emit_sel) {
+            eprintln!("[classify-contigs] (warning) locus asm emit failed: {}", e);
+        }
+        if emit_sel.states.iter().any(|s| s == "reads") {
+            eprintln!("[classify-contigs] note: 'reads' state needs the read pipeline; skipped in --classify-contigs");
+        }
+        if args.verbose { eprintln!("[classify-contigs] Per-locus outputs written ({} classes)", emit_sel.classes.len()); }
+    }
+
+    output_results(&results, args)?;
+    if args.verbose {
+        let resolved = results.iter().filter(|r| r.genus != "Unknown").count();
+        eprintln!("[classify-contigs] Done: {}/{} loci resolved to a genus", resolved, results.len());
+    }
+    Ok(())
+}
+
 fn run_minimap2_contigs(contigs: &Path, db: &Path, output_dir: &Path, minimap2: &str, threads: usize) -> Result<PathBuf> {
     let paf_path = output_dir.join("contigs_to_argdb.paf");
 
@@ -1663,4 +2932,56 @@ fn deduplicate_args(hits: Vec<ArgHit>) -> Vec<ArgHit> {
     let mut result: Vec<ArgHit> = best.into_values().collect();
     result.sort_by(|a, b| b.coverage.partial_cmp(&a.coverage).unwrap_or(std::cmp::Ordering::Equal));
     result
+}
+
+#[cfg(test)]
+mod sam2paf_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Parse a PAF file into (query, matches, block_len) tuples.
+    fn read_paf(path: &Path) -> Vec<(String, usize, usize)> {
+        let mut out = Vec::new();
+        for line in fs::read_to_string(path).unwrap().lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            out.push((f[0].to_string(), f[9].parse().unwrap(), f[10].parse().unwrap()));
+        }
+        out
+    }
+
+    #[test]
+    fn builtin_sam_to_paf_matches_reference_semantics() {
+        let dir = std::env::temp_dir();
+        let sam = dir.join("argenus_test_in.sam");
+        let paf = dir.join("argenus_test_out.paf");
+        let mut w = File::create(&sam).unwrap();
+        writeln!(w, "@SQ\tSN:gene1\tLN:1000").unwrap();
+        // A: 150M, NM=3 -> block_len=150, matches=147 (identity 98%).
+        writeln!(w, "readA\t0\tgene1\t101\t60\t150M\t*\t0\t0\tACGT\t*\tNM:i:3").unwrap();
+        // B: 100M, NM=30 -> block_len=100, matches=70 (identity 70%).
+        writeln!(w, "readB\t0\tgene1\t1\t60\t100M\t*\t0\t0\tACGT\t*\tNM:i:30").unwrap();
+        // C: unmapped (FLAG 4) -> dropped.
+        writeln!(w, "readC\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*").unwrap();
+        // D: 48M2I50M, NM=2 (2 inserted bases) -> m_ops=98, mm=2-2=0, matches=98, block_len=100.
+        writeln!(w, "readD\t0\tgene1\t5\t60\t48M2I50M\t*\t0\t0\tACGT\t*\tNM:i:2").unwrap();
+        // E: 10S140M reverse, NM=0 -> block_len=140, matches=140.
+        writeln!(w, "readE\t16\tgene1\t20\t60\t10S140M\t*\t0\t0\tACGT\t*\tNM:i:0").unwrap();
+        // F: mapped, no NM tag -> dropped.
+        writeln!(w, "readF\t0\tgene1\t1\t60\t100M\t*\t0\t0\tACGT\t*").unwrap();
+        drop(w);
+
+        sam_to_paf_builtin(&sam, &paf).unwrap();
+        let recs = read_paf(&paf);
+        let get = |q: &str| recs.iter().find(|r| r.0 == q).cloned();
+
+        assert_eq!(get("readA"), Some(("readA".into(), 147, 150)));
+        assert_eq!(get("readB"), Some(("readB".into(), 70, 100)));
+        assert_eq!(get("readC"), None, "unmapped read must be dropped");
+        assert_eq!(get("readD"), Some(("readD".into(), 98, 100)));
+        assert_eq!(get("readE"), Some(("readE".into(), 140, 140)));
+        assert_eq!(get("readF"), None, "record without NM tag must be dropped");
+
+        let a = get("readA").unwrap();
+        assert!(((a.1 as f64 / a.2 as f64) * 100.0 - 98.0).abs() < 1e-9);
+    }
 }

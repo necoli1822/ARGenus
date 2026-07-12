@@ -2,6 +2,24 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.3.0] - 2026-07-12
+
+### Added
+
+- **Honest 4-axis classification report**: replaces the single forced "source genus" call
+  - **Genus**: single genus, `multi-genus(N):A/B/C/…` for promiscuous genes, or `Unknown`
+  - **Species**: stricter, separately-thresholded call (`--species-identity`)
+  - **Context**: replicon of the matched flanking (`plasmid` / `chromosome` / `ambiguous` / `NA`), from PLSDB provenance
+  - **Specificity**: how gene-specific the flanking evidence is
+- **Per-locus reassembly** (`--reassemble`, opt-in): core/flank read split + SPAdes to recover classifiable flanking for stalled loci (new `reassemble` module)
+- **Per-locus exports** (`--emit-*`): write gene / flanking sequences for resolved / no-flank-match / gene-not-in-DB classes
+- **Pluggable read filter** (`--mapper strobealign|minimap2|bwa-mem2`)
+- **Contig-only mode** (`--classify-contigs`) to classify a pre-assembled FASTA
+
+### Changed
+
+- **Bounded-memory extension**: extension consensus accumulated as per-position base counts, each contig end capped (`--max-extension`), so runtime/RAM no longer blow up on high-coverage/repetitive loci
+
 ## [0.2.3] - 2026-07-05
 
 ### Fixed
