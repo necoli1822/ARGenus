@@ -100,6 +100,12 @@ coverage, genus-level) is distributed for now; the **5,000 bp** database (higher
 species-level resolution) is much larger and will be released separately once its
 size is reduced. Until then you can build the 5,000 bp DB yourself (see below).
 
+> **Database license:** the pre-built database is derived from
+> [PanRes](https://zenodo.org/records/18606078) and is licensed
+> **[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (non-commercial)** —
+> separate from the MIT-licensed ARGenus code. See [NOTICE](NOTICE) and
+> [License & citation](#license--citation).
+
 The bundle contains:
 
 | File | Size | Role |
@@ -220,17 +226,28 @@ Tab-delimited, one row per ARG locus:
 `multi-genus(N)` and/or `plasmid` = a promiscuous / mobile gene — the genus is not a
 reliable single source.
 
-## Citation
+## License & citation
 
-If you use ARGenus, please cite:
+ARGenus uses **two different licenses** — one for the code, one for the database:
+
+| Component | License | Notes |
+|-----------|---------|-------|
+| ARGenus source code | [MIT](LICENSE) | Free for any use, including commercial |
+| Pre-built database (`argenus-db-*.tar.gz`) | [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) | Derived from PanRes — **non-commercial only** |
+
+The pre-built database is derived from the **PanRes** resistance-gene collection
+([Zenodo](https://zenodo.org/records/18606078), CC BY-NC 4.0), which aggregates
+ResFinder, ResFinderFG, CARD, MEGARes, NCBI AMRFinderPlus, ARG-ANNOT, and BacMet.
+See [NOTICE](NOTICE) for full attribution and the modifications ARGenus makes.
+
+If you use ARGenus, please cite this tool (citation to be added upon publication)
+**and** the PanRes / ARGprofiler database:
 
 ```
-[Citation to be added upon publication]
+Martiny H-M, et al. ARGprofiler—a pipeline for large-scale analysis of antimicrobial
+resistance genes and their flanking regions in metagenomic datasets.
+Bioinformatics 40(3):btae086 (2024). https://doi.org/10.1093/bioinformatics/btae086
 ```
-
-## License
-
-MIT License — see [LICENSE](LICENSE).
 
 ## Contact
 
