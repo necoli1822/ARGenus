@@ -101,7 +101,7 @@ species-level resolution) is much larger and will be released separately once it
 size is reduced. Until then you can build the 5,000 bp DB yourself (see below).
 
 > **Database license:** the pre-built database is derived from
-> [PanRes](https://zenodo.org/records/18606078) and is licensed
+> [PanRes v1.0.0](https://doi.org/10.5281/zenodo.8055116) and is licensed
 > **[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (non-commercial)** —
 > separate from the MIT-licensed ARGenus code. See [NOTICE](NOTICE) and
 > [License & citation](#license--citation).
@@ -235,8 +235,8 @@ ARGenus uses **two different licenses** — one for the code, one for the databa
 | ARGenus source code | [MIT](LICENSE) | Free for any use, including commercial |
 | Pre-built database (`argenus-db-*.tar.gz`) | [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) | Derived from PanRes — **non-commercial only** |
 
-The pre-built database is derived from the **PanRes** resistance-gene collection
-([Zenodo](https://zenodo.org/records/18606078), CC BY-NC 4.0), which aggregates
+The pre-built database is derived from the **PanRes v1.0.0** resistance-gene collection
+([Zenodo, DOI 10.5281/zenodo.8055116](https://doi.org/10.5281/zenodo.8055116), CC BY-NC 4.0), which aggregates
 ResFinder, ResFinderFG, CARD, MEGARes, NCBI AMRFinderPlus, ARG-ANNOT, and BacMet.
 See [NOTICE](NOTICE) for full attribution and the modifications ARGenus makes.
 
