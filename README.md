@@ -97,15 +97,20 @@ argenus -d db/ -1 R1.fq.gz -2 R2.fq.gz -o results/
 
 ARGenus ships two flanking-DB resolutions:
 
-- **1,000 bp** (genus-level, high coverage) — the GitHub Release bundle above
-  (`flanking.fdb` inside `db/`).
-- **5,000 bp** (species-level, higher resolution) — much larger (~9 GB), so it is
-  archived on **Zenodo**: <https://doi.org/10.5281/zenodo.21321983> (CC BY-NC 4.0).
-  Download `flanking_5kbp.fdb` and pass it **explicitly** with `-f` (not `-d`, to
-  avoid ambiguity when several `.fdb` files share a folder):
+- **1,000 bp** (genus-level, high coverage) — the GitHub Release bundle above.
+- **5,000 bp** (species-level, higher resolution) — much larger (~9 GB), archived on
+  **Zenodo**: <https://doi.org/10.5281/zenodo.21321983> (CC BY-NC 4.0).
+
+**Picking a resolution.** `-d` auto-discovery uses a file named exactly `flanking.fdb`
+if one exists, otherwise the **alphabetically-first `*.fdb`** in the folder (no
+warning). So when more than one `.fdb` shares a folder — e.g. both resolutions — the
+auto-pick may not be the one you want. Select the resolution **explicitly with `-f`**:
 
 ```bash
-argenus -f flanking_5kbp.fdb -a db/AMR_PanRes.mmi -1 R1.fq.gz -2 R2.fq.gz -o results/
+# 1,000 bp (genus-level)
+argenus -f flanking_panres_1kbp.fdb -a db/AMR_PanRes.mmi -1 R1.fq.gz -2 R2.fq.gz -o results/
+# 5,000 bp (species-level)
+argenus -f flanking_5kbp.fdb        -a db/AMR_PanRes.mmi -1 R1.fq.gz -2 R2.fq.gz -o results/
 ```
 
 You can also build either database yourself (see below).
