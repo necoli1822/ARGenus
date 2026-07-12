@@ -95,10 +95,20 @@ tar xzf argenus-db-1kbp-v0.3.0.tar.gz       # -> db/
 argenus -d db/ -1 R1.fq.gz -2 R2.fq.gz -o results/
 ```
 
-ARGenus ships two flanking-DB resolutions. Only the **1,000 bp** database (high
-coverage, genus-level) is distributed for now; the **5,000 bp** database (higher,
-species-level resolution) is much larger and will be released separately once its
-size is reduced. Until then you can build the 5,000 bp DB yourself (see below).
+ARGenus ships two flanking-DB resolutions:
+
+- **1,000 bp** (genus-level, high coverage) — the GitHub Release bundle above
+  (`flanking.fdb` inside `db/`).
+- **5,000 bp** (species-level, higher resolution) — much larger (~9 GB), so it is
+  archived on **Zenodo**: <https://doi.org/10.5281/zenodo.21321983> (CC BY-NC 4.0).
+  Download `flanking_5kbp.fdb` and pass it **explicitly** with `-f` (not `-d`, to
+  avoid ambiguity when several `.fdb` files share a folder):
+
+```bash
+argenus -f flanking_5kbp.fdb -a db/AMR_PanRes.mmi -1 R1.fq.gz -2 R2.fq.gz -o results/
+```
+
+You can also build either database yourself (see below).
 
 > **Database license:** the pre-built database is derived from
 > [PanRes v1.0.0](https://doi.org/10.5281/zenodo.8055116) and is licensed
