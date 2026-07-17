@@ -19,12 +19,48 @@ use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::Command;
 
 use crate::snp::{self, SnpStatus};
 
 const FDB_MAGIC: &[u8; 8] = b"FLANKDB\0";
+
+// ============================================================================
+// Embedded phylogenetic-context tables (compiled into the binary)
+// ============================================================================
+// The GTDB genus distance/lineage tables and the conformal calibration are embedded
+// (zstd-compressed) so a deployed binary is self-contained — only the flanking DB (FDB)
+// ships separately. The kernel constants (lambda, coherence radius, absent distance) are
+// calibrated to THIS table's patristic scale, so binding them into one binary prevents an
+// old-table/new-constant version mismatch. An external file of the same name next to the
+// FDB still overrides (for in-place updates); the loader logs which source it used.
+const EMB_GENUS_DIST: &[u8] = include_bytes!("embedded/genus_dist.tsv.zst");
+const EMB_GENUS_LINEAGE: &[u8] = include_bytes!("embedded/genus_lineage.tsv.zst");
+const EMB_CONFORMAL: &[u8] = include_bytes!("embedded/conformal.tsv.zst");
+
+/// Text of a phylogenetic-context table plus a label for its source. Prefers an external file
+/// of `filename` in `db_dir` (lets a newer table override without recompiling); otherwise
+/// decompresses the copy embedded in the binary at build time. The embedded copy always
+/// exists, so these tables are never missing.
+fn context_table_text(
+    db_dir: Option<&Path>,
+    filename: &str,
+    embedded_zst: &[u8],
+) -> Result<(String, String)> {
+    if let Some(dir) = db_dir {
+        let p = dir.join(filename);
+        if p.exists() {
+            let s = std::fs::read_to_string(&p).with_context(|| format!("read {:?}", p))?;
+            return Ok((s, format!("{:?}", p)));
+        }
+    }
+    let bytes =
+        zstd::decode_all(embedded_zst).with_context(|| format!("decode embedded {}", filename))?;
+    let s = String::from_utf8(bytes).with_context(|| format!("embedded {} utf8", filename))?;
+    Ok((s, format!("embedded:{}", filename)))
+}
 
 // ============================================================================
 // Data Structures
@@ -49,6 +85,9 @@ pub struct ArgPosition {
     pub arg_end: usize,
     /// Strand orientation ('+' or '-').
     pub strand: char,
+    /// Redundant PanRes reference IDs tied at this locus (includes `arg_name`). Their
+    /// flanking reference sets are unioned for classification. Never empty.
+    pub members: Vec<String>,
 }
 
 /// Genus classification result for a single ARG.
@@ -94,6 +133,30 @@ pub struct GenusResult {
     pub species_top_matches: Vec<(String, f64)>,
     /// Number of species within GENUS_TIE_PCT of the top species score.
     pub n_species_tied: usize,
+    /// Credible set: genera accumulating posterior mass to the conformal threshold, each
+    /// with its posterior — the structured form of the answer (a set of taxa, not a single
+    /// call). The TSV emits its grouped display (`credible_set_grouped`); this Vec is kept
+    /// for programmatic consumers.
+    #[allow(dead_code)]
+    pub credible_set: Vec<(String, f64)>,
+    /// Posterior mass covered by `credible_set` (≈0.9+). UNCALIBRATED until conformal
+    /// calibration is fitted on a ground-truth set; treat as a raw confidence for now.
+    pub support: f64,
+    /// Mash radius of the credible set: max distance from its medoid to any member. 0 for
+    /// a single-genus call; larger = the shared context spans a broader clade.
+    pub resolution_distance: f64,
+    /// Why resolution stopped: "query" (flank truncated by the contig edge), "biology"
+    /// (full flank but context genuinely shared across genera), or "none" (single genus).
+    pub limited_by: String,
+    /// Ragged rank of the answer: the LCA rank of the credible set (species/genus/family/
+    /// …/root). This is the taxonomic level at which the ARG's context is actually shared.
+    pub resolution_rank: String,
+    /// LCA taxon name at `resolution_rank` (e.g. "Enterobacteriaceae").
+    pub resolution_taxon: String,
+    /// The credible set rendered with its close-genera sub-clusters grouped (see
+    /// [`group_credible_set`]): `g1(p1),g2(p2) | g3(p3)`. This is the display form of
+    /// `credible_set`; empty when there is none.
+    pub credible_set_grouped: String,
 }
 
 impl Default for GenusResult {
@@ -115,6 +178,13 @@ impl Default for GenusResult {
             species: None,
             species_top_matches: vec![],
             n_species_tied: 0,
+            credible_set: vec![],
+            support: 0.0,
+            resolution_distance: 0.0,
+            limited_by: "none".to_string(),
+            resolution_rank: "NA".to_string(),
+            resolution_taxon: "NA".to_string(),
+            credible_set_grouped: String::new(),
         }
     }
 }
@@ -258,7 +328,7 @@ impl FlankingDatabase {
     ///
     /// Decompresses the gene block on demand.
     /// Supports both direct key lookup and gene name mapping (e.g., "mexQ" -> "mexQ|DRUG|CLASS|CODE").
-    pub fn get_gene_records(&mut self, gene: &str) -> Result<Vec<FlankingRecord>> {
+    pub fn get_gene_records(&self, gene: &str) -> Result<Vec<FlankingRecord>> {
         // Try direct lookup, then gene name mapping
         let lookup_key = if self.index.contains_key(gene) {
             gene.to_string()
@@ -269,13 +339,12 @@ impl FlankingDatabase {
         };
 
         let entry = self.index.get(&lookup_key)
-            .ok_or_else(|| anyhow::anyhow!("Gene not found in index: {}", lookup_key))?
-            .clone();
+            .ok_or_else(|| anyhow::anyhow!("Gene not found in index: {}", lookup_key))?;
 
-        // Read compressed block
-        self.file.seek(SeekFrom::Start(entry.offset))?;
+        // Positioned read at the block offset — does not move a shared file cursor, so
+        // this is &self and safe to call concurrently from many threads.
         let mut compressed = vec![0u8; entry.compressed_len as usize];
-        self.file.read_exact(&mut compressed)?;
+        self.file.read_exact_at(&mut compressed, entry.offset)?;
 
         // Decompress with zstd
         let decompressed = zstd::decode_all(&compressed[..])?;
@@ -309,24 +378,190 @@ impl FlankingDatabase {
         Ok(records)
     }
 
-    /// Computes genus distribution for a gene.
-    ///
-    /// Returns a map of genus → occurrence count.
-    pub fn get_genus_distribution(&mut self, gene: &str) -> Result<FxHashMap<String, usize>> {
-        let records = self.get_gene_records(gene)?;
-        let mut dist: FxHashMap<String, usize> = FxHashMap::default();
-
-        for rec in records {
-            *dist.entry(rec.genus).or_default() += 1;
-        }
-
-        Ok(dist)
-    }
 }
 
 // ============================================================================
 // Genus Classifier
 // ============================================================================
+
+/// Mash distance between two genus representatives from a neighbor map; 0 if identical,
+/// 1.0 (≈ w→0) if the pair is absent (pruned as too distant, or a novel label).
+fn ou_lookup(neighbors: &FxHashMap<String, FxHashMap<String, f64>>, a: &str, b: &str) -> f64 {
+    if a == b {
+        return 0.0;
+    }
+    if let Some(m) = neighbors.get(a) {
+        if let Some(&d) = m.get(b) {
+            return d;
+        }
+    }
+    if let Some(m) = neighbors.get(b) {
+        if let Some(&d) = m.get(a) {
+            return d;
+        }
+    }
+    ABSENT_PATRISTIC
+}
+
+/// Distance assigned when a genus pair is absent from the GTDB patristic table. Set beyond the
+/// inter-domain median (~2.76 subs/site) so an absent relative contributes ≈0 kernel weight
+/// (exp(-3/λ) with λ=0.3 ≈ 5e-5): "unknown neighbor" is treated as "maximally far", never as a
+/// close borrow. (Was 1.0 on the old mash scale where distances saturated near 0.34.)
+const ABSENT_PATRISTIC: f64 = 3.0;
+
+/// Phylogenetic OU-kernel posterior over genera from per-genus likelihoods.
+///
+/// post[T] = Σ_{T'} w(T,T')·L[T'] / Σ_{T'} w(T,T'),  w(d) = exp(-d/λ), then normalized to
+/// sum 1. Sparse genera borrow evidence from close relatives (Escherichia↔Shigella
+/// d≈0.03), so a novel query's mass climbs to the correct clade instead of collapsing
+/// onto one reference — this is what kills the argmax/DB-depth bias. Returns (genus,
+/// posterior) sorted descending. With an empty neighbor map every off-diagonal weight is
+/// exp(-ABSENT_PATRISTIC/λ)≈0, so the result degenerates to the normalized likelihoods (no
+/// smoothing).
+fn ou_posterior(
+    likelihoods: &FxHashMap<String, f64>,
+    neighbors: &FxHashMap<String, FxHashMap<String, f64>>,
+    lambda: f64,
+) -> Vec<(String, f64)> {
+    let genera: Vec<&String> = likelihoods.keys().collect();
+    let mut post: Vec<(String, f64)> = Vec::with_capacity(genera.len());
+    for &ta in &genera {
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for &tb in &genera {
+            let w = (-ou_lookup(neighbors, ta, tb) / lambda).exp();
+            num += w * likelihoods[tb];
+            den += w;
+        }
+        post.push((ta.clone(), if den > 0.0 { num / den } else { 0.0 }));
+    }
+    let z: f64 = post.iter().map(|(_, p)| *p).sum();
+    if z > 0.0 {
+        for p in post.iter_mut() {
+            p.1 /= z;
+        }
+    }
+    post.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    post
+}
+
+/// A credible set whose patristic radius is within this is "phylogenetically coherent" — a
+/// tight cluster of close genera — and is reported as the genus list rather than rolled up.
+/// The criterion is phylogenetic COHERENCE (the radius), NOT the number of genera: two far
+/// genera and ten close ones are different answers even at the same family. Scaled to the GTDB
+/// patristic table (genus-pair median ≈0.19, family-pair median ≈0.60), so 0.5 sits just below
+/// the family diameter: within-family sisters list individually; a set spilling past one family
+/// rolls up to its LCA. (Was 0.12 on the old mash scale, which saturated near 0.30 at family.)
+const GENUS_COHERENCE_RADIUS: f64 = 0.5;
+
+/// Renders the credible set's resolution notation. The credible set itself is the answer
+/// (in `Credible_Set`); this chooses the human label for `Resolution_Rank`/`_Taxon` from the
+/// set's phylogenetic COHERENCE (its mash `radius`), not its size:
+///   - one genus                    → ("genus", that genus)
+///   - several genera, radius tight  → ("genus", "Escherichia|Shigella") — a coherent
+///     cluster of close genera, named individually (strictly more specific than the family)
+///   - several genera, radius spread → (LCA rank, LCA taxon) — the genera fan out across a
+///     family/order/…, so the clade name is the honest summary
+/// {Escherichia, Shigella} (radius ≈0.03) lists both genera; a set fanning across
+/// Enterobacteriaceae (radius ≈0.17) reports "Enterobacteriaceae" even if it's only 2 genera.
+fn render_resolution(members: &[&str], lca_rank: &str, lca_taxon: &str, radius: f64)
+    -> (String, String) {
+    if members.len() == 1 {
+        ("genus".to_string(), members[0].to_string())
+    } else if radius <= GENUS_COHERENCE_RADIUS {
+        ("genus".to_string(), members.join("|"))
+    } else {
+        (lca_rank.to_string(), lca_taxon.to_string())
+    }
+}
+
+/// Renders the credible set with its internal phylogenetic structure exposed: genera are
+/// single-linkage clustered by mash distance (two genera join if within `threshold`), so a
+/// tight sub-cluster (Escherichia+Pseudescherichia) is shown as one group and the genera it
+/// fans out to are shown separately. Clusters are sorted by total posterior mass; within a
+/// cluster, members by posterior. Format: `g1(p1),g2(p2) | g3(p3) | g4(p4)` — commas inside
+/// a tight cluster, ` | ` between clusters. A flat list hides that the mass is really on one
+/// close group plus a few outliers; this shows it.
+fn group_credible_set(
+    members: &[(String, f64)],
+    neighbors: &FxHashMap<String, FxHashMap<String, f64>>,
+    threshold: f64,
+) -> String {
+    let n = members.len();
+    if n == 0 {
+        return "NA".to_string();
+    }
+    if n == 1 {
+        return format!("{}({:.2})", members[0].0, members[0].1);
+    }
+    // Single-linkage union-find over pairs within `threshold`.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if ou_lookup(neighbors, &members[i].0, &members[j].0) <= threshold {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut clusters: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        clusters.entry(r).or_default().push(i);
+    }
+    let mut rendered: Vec<(f64, String)> = clusters
+        .values()
+        .map(|idxs| {
+            let mut mem = idxs.clone();
+            mem.sort_by(|&a, &b| {
+                members[b].1.partial_cmp(&members[a].1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mass: f64 = mem.iter().map(|&k| members[k].1).sum();
+            let s = mem.iter()
+                .map(|&k| format!("{}({:.2})", members[k].0, members[k].1))
+                .collect::<Vec<_>>()
+                .join(",");
+            (mass, s)
+        })
+        .collect();
+    rendered.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    rendered.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(" | ")
+}
+
+/// Lowest common ancestor of a set of genera over their lineages: the finest standard
+/// rank at which every member shares one non-empty taxon. Returns (rank, taxon). A single
+/// genus resolves to ("genus", that genus); genera that agree only at the root give
+/// ("root", "unclassified"). This renders the credible set as one ragged-rank label —
+/// multi-genus {Escherichia, Salmonella} → ("family", "Enterobacteriaceae").
+fn lca_of(genera: &[&str], lineage: &FxHashMap<String, [String; 7]>) -> (String, String) {
+    let lins: Vec<&[String; 7]> = genera.iter().filter_map(|g| lineage.get(*g)).collect();
+    if lins.is_empty() {
+        // No lineage info: fall back to the genus label itself if singleton.
+        return if genera.len() == 1 {
+            ("genus".to_string(), genera[0].to_string())
+        } else {
+            ("root".to_string(), "unclassified".to_string())
+        };
+    }
+    // Finest → coarsest, capped at genus (idx 5): the credible set is a set of GENERA, so
+    // the species column (a representative genome's species) is not a valid resolution —
+    // species-level calls come from the separate species tally, not this LCA.
+    for r in (0..6).rev() {
+        let first = &lins[0][r];
+        if !first.is_empty() && lins.iter().all(|l| &l[r] == first) {
+            return (LINEAGE_RANKS[r].to_string(), first.clone());
+        }
+    }
+    ("root".to_string(), "unclassified".to_string())
+}
 
 /// Minimap2-based genus classifier using flanking sequence alignment.
 ///
@@ -349,7 +584,35 @@ pub struct GenusClassifier {
     /// → "plasmid", frac <= `plasmid_lo` → "chromosome", else "ambiguous".
     plasmid_hi: f64,
     plasmid_lo: f64,
+    /// Optional cap on reference flanks aligned per locus (0 = unlimited). A few genes
+    /// carry tens of thousands of flanks; capping trades some accuracy for speed.
+    max_ref_flanks: usize,
+    /// Phylogenetic OU kernel: genus -> [(neighbor_genus, mash_distance)]. Loaded from a
+    /// sibling `genus_dist.tsv` next to the FDB (genus-representative mash distances,
+    /// k=21 s=100000). Empty => no smoothing (posterior = normalized per-genus likelihood).
+    genus_neighbors: FxHashMap<String, FxHashMap<String, f64>>,
+    /// OU relaxation length (= 1/alpha). ln2*lambda = distance at which borrowed
+    /// evidence halves. NOT Pagel's lambda.
+    kernel_lambda: f64,
+    /// Likelihood sharpness: L = exp(-(1 - ani)/tau) per alignment, ani = identity/100.
+    kernel_tau: f64,
+    /// genus -> its standard 7-rank lineage [superkingdom, phylum, class, order, family,
+    /// genus, species]. Loaded from sibling `genus_lineage.tsv`. Enables reporting the
+    /// credible set's LCA as a ragged rank (e.g. multi-genus Enterobacteriaceae → family).
+    genus_lineage: FxHashMap<String, [String; 7]>,
+    /// Conformal credible-set mass threshold θ for the requested target coverage, read
+    /// from sibling `conformal.tsv`. The set grows until its posterior mass reaches θ,
+    /// which guarantees the true host's clade is covered at ≥ the target rate. Falls back
+    /// to `DEFAULT_CREDIBLE_MASS` (uncalibrated) when the table is absent.
+    conformal_theta: f64,
 }
+
+/// Uncalibrated fallback credible-set mass when no `conformal.tsv` is available.
+const DEFAULT_CREDIBLE_MASS: f64 = 0.9;
+
+/// Standard ranks, coarsest → finest, matching the columns of `genus_lineage.tsv`.
+const LINEAGE_RANKS: [&str; 7] =
+    ["superkingdom", "phylum", "class", "order", "family", "genus", "species"];
 
 impl GenusClassifier {
     /// Creates a new genus classifier.
@@ -371,7 +634,12 @@ impl GenusClassifier {
         species_map_path: Option<&Path>,
         plasmid_hi: f64,
         plasmid_lo: f64,
+        max_ref_flanks: usize,
+        // Requested coverage for the conformal credible set (e.g. 0.9 = the true host's
+        // clade is inside the reported set >=90% of the time). Selects θ from conformal.tsv.
+        target_coverage: f64,
     ) -> Result<Self> {
+        let db_dir = db_path.as_ref().parent().map(|p| p.to_path_buf());
         let db = FlankingDatabase::open(db_path)?;
         let mut plasmid_contigs = rustc_hash::FxHashSet::default();
         if let Some(p) = plasmid_contigs_path {
@@ -392,6 +660,76 @@ impl GenusClassifier {
                 }
             }
         }
+        // Phylogenetic OU kernel distances: sibling `genus_dist.tsv` next to the FDB.
+        // Format: genus_a \t genus_b \t mash_distance (both directions present). Absent
+        // => empty map => posterior degenerates to normalized per-genus likelihood.
+        let mut genus_neighbors: FxHashMap<String, FxHashMap<String, f64>> = FxHashMap::default();
+        {
+            let (gd_text, gd_src) =
+                context_table_text(db_dir.as_deref(), "genus_dist.tsv", EMB_GENUS_DIST)?;
+            let mut npair = 0usize;
+            for line in gd_text.lines() {
+                let mut it = line.split('\t');
+                if let (Some(a), Some(b), Some(d)) = (it.next(), it.next(), it.next()) {
+                    if let Ok(d) = d.trim().parse::<f64>() {
+                        genus_neighbors.entry(a.to_string()).or_default()
+                            .insert(b.to_string(), d);
+                        npair += 1;
+                    }
+                }
+            }
+            eprintln!("[kernel] loaded {} genus-distance pairs from {}", npair, gd_src);
+        }
+        // Ragged-rank lineage: sibling `genus_lineage.tsv`, header
+        // `genus<TAB>superkingdom..species`. Absent => LCA reporting disabled (genus only).
+        let mut genus_lineage: FxHashMap<String, [String; 7]> = FxHashMap::default();
+        {
+            let (gl_text, gl_src) =
+                context_table_text(db_dir.as_deref(), "genus_lineage.tsv", EMB_GENUS_LINEAGE)?;
+            for (i, line) in gl_text.lines().enumerate() {
+                if i == 0 {
+                    continue; // header
+                }
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() >= 8 {
+                    let mut lin: [String; 7] = Default::default();
+                    for r in 0..7 {
+                        lin[r] = cols[r + 1].to_string();
+                    }
+                    genus_lineage.insert(cols[0].to_string(), lin);
+                }
+            }
+            eprintln!("[kernel] loaded {} genus lineages from {}", genus_lineage.len(), gl_src);
+        }
+        // Conformal θ: sibling `conformal.tsv`, rows `target_coverage<TAB>theta<TAB>...`.
+        // Pick the row whose target is closest to the requested coverage.
+        let mut conformal_theta = DEFAULT_CREDIBLE_MASS;
+        let mut conformal_target = 0.0;
+        {
+            let (cf_text, cf_src) =
+                context_table_text(db_dir.as_deref(), "conformal.tsv", EMB_CONFORMAL)?;
+            let mut best = f64::MAX;
+            for line in cf_text.lines() {
+                if line.starts_with('#') || line.trim().is_empty() {
+                    continue;
+                }
+                let c: Vec<&str> = line.split('\t').collect();
+                if c.len() >= 2 {
+                    if let (Ok(t), Ok(th)) = (c[0].parse::<f64>(), c[1].parse::<f64>()) {
+                        let d = (t - target_coverage).abs();
+                        if d < best {
+                            best = d;
+                            conformal_theta = th;
+                            conformal_target = t;
+                        }
+                    }
+                }
+            }
+            if conformal_target > 0.0 {
+                eprintln!("[kernel] conformal θ={:.3} for target coverage {:.2} (from {})",
+                          conformal_theta, conformal_target, cf_src);
+            }
+        }
         Ok(Self {
             db,
             minimap2_path: minimap2_path.to_string(),
@@ -403,32 +741,90 @@ impl GenusClassifier {
             species_map,
             plasmid_hi,
             plasmid_lo,
+            max_ref_flanks,
+            genus_neighbors,
+            kernel_lambda: 0.3,
+            kernel_tau: 0.01,
+            genus_lineage,
+            conformal_theta,
         })
+    }
+
+    /// Phylogenetic OU-kernel posterior over genera from per-genus likelihoods, using
+    /// this classifier's loaded genus distances and lambda. Thin wrapper over the free
+    /// [`ou_posterior`] (extracted so the kernel math is unit-testable without an FDB).
+    fn kernel_posterior(&self, likelihoods: &FxHashMap<String, f64>) -> Vec<(String, f64)> {
+        ou_posterior(likelihoods, &self.genus_neighbors, self.kernel_lambda)
     }
 
     /// Classifies genus for multiple ARG positions.
     ///
-    /// Processes each position sequentially to avoid temporary file conflicts.
+    /// Two phases: (1) a serial pass reads every gene's flanking records and genus
+    /// distribution from the .fdb — the only work needing `&mut self` (the reader
+    /// seeks the file) — deduplicated by gene; (2) the flanking alignment + scoring
+    /// per locus, which is independent and CPU/subprocess-bound, runs in parallel.
+    /// Each locus writes its own indexed temp files, so there are no conflicts.
     pub fn classify_batch(&mut self, positions: &[ArgPosition], threads: usize) -> Result<Vec<GenusResult>> {
-        let mut results = Vec::with_capacity(positions.len());
+        use rayon::prelude::*;
+        use std::collections::HashSet;
 
-        for pos in positions {
-            let result = self.classify_single(pos, threads)?;
-            results.push(result);
-        }
+        let this: &GenusClassifier = self;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build()?;
 
-        Ok(results)
+        // Unique genes present in the DB — dedup so a gene shared by many loci is read
+        // and decompressed only once.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let unique_genes: Vec<&str> = positions.iter()
+            .flat_map(|p| p.members.iter().map(|s| s.as_str()))
+            .filter(|&g| this.db.has_gene(g) && seen.insert(g))
+            .collect();
+
+        pool.install(|| -> Result<Vec<GenusResult>> {
+            // Phase 1 (parallel): positioned reads (read_at) decompress each gene block
+            // concurrently; the genus distribution is derived from the same records so
+            // the block is decompressed only once.
+            let loaded: Vec<(String, Vec<FlankingRecord>, FxHashMap<String, usize>)> = unique_genes
+                .par_iter()
+                .map(|&g| {
+                    let recs = this.db.get_gene_records(g)?;
+                    let mut dist: FxHashMap<String, usize> = FxHashMap::default();
+                    for rec in &recs { *dist.entry(rec.genus.clone()).or_default() += 1; }
+                    Ok((g.to_string(), recs, dist))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let mut recs_by_gene: FxHashMap<String, Vec<FlankingRecord>> = FxHashMap::default();
+            let mut dist_by_gene: FxHashMap<String, FxHashMap<String, usize>> = FxHashMap::default();
+            for (g, recs, dist) in loaded {
+                recs_by_gene.insert(g.clone(), recs);
+                dist_by_gene.insert(g, dist);
+            }
+
+            // Phase 2 (parallel): flanking alignment + scoring, one locus per task.
+            positions
+                .par_iter()
+                .enumerate()
+                .map(|(idx, pos)| this.classify_prepared(pos, idx, &recs_by_gene, &dist_by_gene))
+                .collect()
+        })
     }
 
-    /// Classifies genus for a single ARG position.
+    /// Classifies genus for a single ARG position using preloaded per-gene data
+    /// (so it needs only `&self` and is safe to run in parallel across loci).
     ///
     /// # Algorithm
     /// 1. Extract flanking sequences from contig
-    /// 2. Write query and reference FASTA files
-    /// 3. Run minimap2 alignment
+    /// 2. Write query and reference FASTA files (indexed by `idx` to avoid conflicts)
+    /// 3. Run minimap2 alignment (single-threaded; parallelism is across loci)
     /// 4. Parse PAF and score genus candidates
     /// 5. Return top genus with confidence metrics
-    pub fn classify_single(&mut self, pos: &ArgPosition, threads: usize) -> Result<GenusResult> {
+    fn classify_prepared(
+        &self,
+        pos: &ArgPosition,
+        idx: usize,
+        recs_by_gene: &FxHashMap<String, Vec<FlankingRecord>>,
+        dist_by_gene: &FxHashMap<String, FxHashMap<String, usize>>,
+    ) -> Result<GenusResult> {
         // Extract flanking sequences
         let (upstream, downstream) = self.extract_flanking_regions(pos);
 
@@ -465,11 +861,18 @@ impl GenusClassifier {
                 species: None,
                 species_top_matches: vec![],
                 n_species_tied: 0,
+                credible_set: vec![],
+                support: 0.0,
+                resolution_distance: 0.0,
+                limited_by: "none".to_string(),
+                resolution_rank: "NA".to_string(),
+                resolution_taxon: "NA".to_string(),
+                credible_set_grouped: String::new(),
             });
         }
 
-        // Check if gene exists in database
-        if !self.db.has_gene(&pos.arg_name) {
+        // Check if gene exists in database (any tied member present == has_gene)
+        if !pos.members.iter().any(|m| recs_by_gene.contains_key(m)) {
             return Ok(GenusResult {
                 arg_name: pos.arg_name.clone(),
                 contig_name: pos.contig_name.clone(),
@@ -487,11 +890,31 @@ impl GenusClassifier {
                 species: None,
                 species_top_matches: vec![],
                 n_species_tied: 0,
+                credible_set: vec![],
+                support: 0.0,
+                resolution_distance: 0.0,
+                limited_by: "none".to_string(),
+                resolution_rank: "NA".to_string(),
+                resolution_taxon: "NA".to_string(),
+                credible_set_grouped: String::new(),
             });
         }
 
-        // Get reference flanking sequences
-        let ref_records = self.db.get_gene_records(&pos.arg_name)?;
+        // Union the flanking references of all tied redundant refs at this locus, so the
+        // same physical gene's evidence from every source DB is used together.
+        let mut ref_records: Vec<&FlankingRecord> = pos.members.iter()
+            .filter_map(|m| recs_by_gene.get(m))
+            .flatten()
+            .collect();
+        // Optional speed cap (self.max_ref_flanks, 0 = unlimited/default): some genes
+        // carry tens of thousands of flanks (up to ~128k), which dominate wall-clock
+        // (writing + indexing + aligning). An evenly-strided sample keeps most of the
+        // genus signal but DOES shift the call on those heavy loci, so it is off by
+        // default; the specificity denominator always uses the full counts.
+        if self.max_ref_flanks > 0 && ref_records.len() > self.max_ref_flanks {
+            let step = ref_records.len() / self.max_ref_flanks;
+            ref_records = ref_records.iter().step_by(step).copied().take(self.max_ref_flanks).collect();
+        }
         if ref_records.is_empty() {
             return Ok(GenusResult {
                 arg_name: pos.arg_name.clone(),
@@ -510,15 +933,27 @@ impl GenusClassifier {
                 species: None,
                 species_top_matches: vec![],
                 n_species_tied: 0,
+                credible_set: vec![],
+                support: 0.0,
+                resolution_distance: 0.0,
+                limited_by: "none".to_string(),
+                resolution_rank: "NA".to_string(),
+                resolution_taxon: "NA".to_string(),
+                credible_set_grouped: String::new(),
             });
         }
 
-        // Create temporary files for alignment
-        let temp_dir = std::env::temp_dir();
+        // Create temporary files for alignment. Prefer tmpfs (/dev/shm) to avoid disk
+        // I/O, and key names by pid+idx so parallel loci never collide.
+        let temp_dir = if Path::new("/dev/shm").is_dir() {
+            std::path::PathBuf::from("/dev/shm")
+        } else {
+            std::env::temp_dir()
+        };
         let pid = std::process::id();
-        let query_path = temp_dir.join(format!("argenus_query_{}.fas", pid));
-        let ref_path = temp_dir.join(format!("argenus_ref_{}.fas", pid));
-        let paf_path = temp_dir.join(format!("argenus_align_{}.paf", pid));
+        let query_path = temp_dir.join(format!("argenus_query_{}_{}.fas", pid, idx));
+        let ref_path = temp_dir.join(format!("argenus_ref_{}_{}.fas", pid, idx));
+        let paf_path = temp_dir.join(format!("argenus_align_{}_{}.paf", pid, idx));
 
         // Write query FASTA
         {
@@ -550,7 +985,7 @@ impl GenusClassifier {
 
         // Run minimap2 with sr preset for short queries
         let output = Command::new(&self.minimap2_path)
-            .args(["-x", "sr", "-t", &threads.to_string(), "-c", "--secondary=yes", "-N", "100", "-k", "15", "-w", "5"])
+            .args(["-x", "sr", "-t", "1", "-c", "--secondary=yes", "-N", "100", "-k", "15", "-w", "5"])
             .arg(&ref_path)
             .arg(&query_path)
             .arg("-o").arg(&paf_path)
@@ -581,11 +1016,19 @@ impl GenusClassifier {
                 species: None,
                 species_top_matches: vec![],
                 n_species_tied: 0,
+                credible_set: vec![],
+                support: 0.0,
+                resolution_distance: 0.0,
+                limited_by: "none".to_string(),
+                resolution_rank: "NA".to_string(),
+                resolution_taxon: "NA".to_string(),
+                credible_set_grouped: String::new(),
             });
         }
 
         // Parse PAF and calculate genus scores + plasmid provenance + species scores.
-        let (genus_scores, plasmid_frac, species_scores) = self.calculate_genus_scores(&paf_path)?;
+        let (genus_likelihood, genus_confidence, plasmid_frac, species_scores) =
+            self.calculate_genus_scores(&paf_path)?;
 
         // Cleanup temporary files
         let _ = std::fs::remove_file(&query_path);
@@ -596,7 +1039,7 @@ impl GenusClassifier {
         // "plasmid" = the flanking mostly matched PLSDB-derived plasmid references
         // (genus is then unreliable — the ARG is on a mobile element). NA when no
         // plasmid list is loaded OR the flanking matched nothing (no basis to judge).
-        let context = if self.plasmid_contigs.is_empty() || genus_scores.is_empty() {
+        let context = if self.plasmid_contigs.is_empty() || genus_likelihood.is_empty() {
             "NA".to_string()
         } else if plasmid_frac >= self.plasmid_hi {
             "plasmid".to_string()
@@ -606,34 +1049,96 @@ impl GenusClassifier {
             "ambiguous".to_string()
         };
 
-        // Calculate genus specificity from database
-        let genus_dist = self.db.get_genus_distribution(&pos.arg_name)?;
+        // Calculate genus specificity from the DB, combined over all tied members.
+        let mut genus_dist: FxHashMap<String, usize> = FxHashMap::default();
+        for m in &pos.members {
+            if let Some(d) = dist_by_gene.get(m) {
+                for (k, v) in d { *genus_dist.entry(k.clone()).or_default() += *v; }
+            }
+        }
         let total_in_db: usize = genus_dist.values().sum();
 
-        // Determine best genus
-        let mut sorted_scores: Vec<(String, f64)> = genus_scores.into_iter().collect();
-        sorted_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Determine best genus via the phylogenetic OU-kernel posterior (replaces the
+        // old count-weighted identity score). `sorted_scores` now holds (genus, posterior)
+        // in descending posterior order; DB depth no longer biases the ranking.
+        let sorted_scores: Vec<(String, f64)> = self.kernel_posterior(&genus_likelihood);
 
-        let (genus, confidence, specificity) = if let Some((best_genus, best_score)) = sorted_scores.first() {
+        let (genus, confidence, specificity) = if let Some((best_genus, _post)) = sorted_scores.first() {
             let genus_count = genus_dist.get(best_genus).copied().unwrap_or(0);
             let specificity = if total_in_db > 0 {
                 (genus_count as f64 / total_in_db as f64) * 100.0
             } else {
                 0.0
             };
-
-            (Some(best_genus.clone()), *best_score, specificity)
+            // Confidence stays on the 0-100 identity scale (mean alignment identity of the
+            // called genus), independent of the posterior used for ranking.
+            let conf = genus_confidence.get(best_genus).copied().unwrap_or(0.0);
+            (Some(best_genus.clone()), conf, specificity)
         } else {
             (None, 0.0, 0.0)
         };
 
-        // Count ALL genera tied near the top (from the full list, before truncation),
-        // so multi-genus reporting can state the true breadth even beyond top-5.
-        let n_genera_tied = match sorted_scores.first() {
-            Some((_, best)) => sorted_scores.iter()
-                .filter(|(g, s)| !g.is_empty() && *s >= best - GENUS_TIE_PCT)
-                .count(),
-            None => 0,
+        // Credible set: the smallest prefix of the posterior-sorted genera whose mass
+        // reaches the conformal threshold θ. θ is calibrated so that the true host's clade
+        // falls inside the set's LCA at ≥ the target coverage — this is what makes Support
+        // mean something. Uncalibrated (θ = DEFAULT_CREDIBLE_MASS) when conformal.tsv is
+        // absent. Single genus = resolved; several = shared/mobile context.
+        let mut credible_set: Vec<(String, f64)> = Vec::new();
+        let mut support = 0.0f64;
+        for (g, p) in &sorted_scores {
+            credible_set.push((g.clone(), *p));
+            support += *p;
+            if support >= self.conformal_theta {
+                break;
+            }
+        }
+        let n_genera_tied = credible_set.len();
+
+        // Resolution distance = mash radius of the credible set around its posterior-
+        // weighted medoid (the member minimizing Σ p·d to the others). 0 for one genus.
+        let resolution_distance = if credible_set.len() < 2 {
+            0.0
+        } else {
+            let members: Vec<&str> = credible_set.iter().map(|(g, _)| g.as_str()).collect();
+            let medoid = members.iter().min_by(|&&a, &&b| {
+                let sa: f64 = credible_set.iter()
+                    .map(|(g, p)| p * ou_lookup(&self.genus_neighbors, a, g)).sum();
+                let sb: f64 = credible_set.iter()
+                    .map(|(g, p)| p * ou_lookup(&self.genus_neighbors, b, g)).sum();
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            }).copied().unwrap_or(members[0]);
+            members.iter()
+                .map(|&g| ou_lookup(&self.genus_neighbors, medoid, g))
+                .fold(0.0f64, f64::max)
+        };
+
+        // Limited-by: was resolution capped by the query (contig edge cut the flank) or by
+        // biology (full flank, but the context is genuinely shared across genera)?
+        let reach_up = pos.arg_start.min(self.max_flanking);
+        let reach_dn = pos.contig_len.saturating_sub(pos.arg_end).min(self.max_flanking);
+        let contig_limited = reach_up < self.max_flanking || reach_dn < self.max_flanking;
+        let limited_by = if credible_set.len() < 2 {
+            "none".to_string()
+        } else if contig_limited {
+            "query".to_string()
+        } else {
+            "biology".to_string()
+        };
+
+        // Ragged rank: the LCA of the credible set is the taxonomic level at which this
+        // ARG's context is actually shared (single genus → genus; several → their family
+        // or higher). This is the honest answer, not a forced single genus.
+        let (resolution_rank, resolution_taxon) = if credible_set.is_empty() {
+            ("NA".to_string(), "NA".to_string())
+        } else {
+            let members: Vec<&str> = credible_set.iter().map(|(g, _)| g.as_str()).collect();
+            let (lca_rank, lca_taxon) = lca_of(&members, &self.genus_lineage);
+            render_resolution(&members, &lca_rank, &lca_taxon, resolution_distance)
+        };
+        let credible_set_grouped = if credible_set.is_empty() {
+            String::new()
+        } else {
+            group_credible_set(&credible_set, &self.genus_neighbors, GENUS_COHERENCE_RADIUS)
         };
 
         let top_matches: Vec<(String, f64)> = sorted_scores.into_iter().take(5).collect();
@@ -667,6 +1172,13 @@ impl GenusClassifier {
             species,
             species_top_matches,
             n_species_tied,
+            credible_set,
+            support,
+            resolution_distance,
+            limited_by,
+            resolution_rank,
+            resolution_taxon,
+            credible_set_grouped,
         })
     }
 
@@ -703,7 +1215,11 @@ impl GenusClassifier {
     }
 
     /// Parses PAF alignment file and calculates genus scores.
-    fn calculate_genus_scores(&self, paf_path: &Path) -> Result<(FxHashMap<String, f64>, f64, FxHashMap<String, f64>)> {
+    /// Parses the PAF and returns per-genus (mean likelihood, mean identity), the plasmid
+    /// fraction, and per-species mean identity. The kernel posterior consumes the
+    /// likelihoods; the identities feed confidence/context (kept on the 0-100 scale).
+    fn calculate_genus_scores(&self, paf_path: &Path)
+        -> Result<(FxHashMap<String, f64>, FxHashMap<String, f64>, f64, FxHashMap<String, f64>)> {
         let file = File::open(paf_path)?;
         let reader = BufReader::new(file);
 
@@ -765,16 +1281,23 @@ impl GenusClassifier {
             }
         }
 
-        // Calculate average score per genus
-        let mut genus_scores: FxHashMap<String, f64> = FxHashMap::default();
+        // Per-genus mean likelihood (kernel input) and mean identity (confidence). The
+        // likelihood is averaged WITHIN genus so DB depth (many flanks of one genus) can
+        // no longer inflate the score — the old count bonus did exactly that.
+        let tau = self.kernel_tau;
+        let mut genus_likelihood: FxHashMap<String, f64> = FxHashMap::default();
+        let mut genus_confidence: FxHashMap<String, f64> = FxHashMap::default();
         for (genus, scores) in genus_matches {
             if scores.is_empty() {
                 continue;
             }
-            // Weighted score: average identity with count bonus
-            let avg_identity = scores.iter().sum::<f64>() / scores.len() as f64;
-            let count_bonus = (scores.len() as f64).ln().max(1.0);
-            genus_scores.insert(genus, avg_identity * count_bonus / count_bonus.max(1.0));
+            let n = scores.len() as f64;
+            let mean_id = scores.iter().sum::<f64>() / n;
+            let mean_lik = scores.iter()
+                .map(|id| (-(1.0 - id / 100.0) / tau).exp())
+                .sum::<f64>() / n;
+            genus_likelihood.insert(genus.clone(), mean_lik);
+            genus_confidence.insert(genus, mean_id);
         }
 
         let mut species_scores: FxHashMap<String, f64> = FxHashMap::default();
@@ -785,7 +1308,7 @@ impl GenusClassifier {
         }
 
         let plasmid_frac = if total_hits > 0 { plasmid_hits as f64 / total_hits as f64 } else { 0.0 };
-        Ok((genus_scores, plasmid_frac, species_scores))
+        Ok((genus_likelihood, genus_confidence, plasmid_frac, species_scores))
     }
 
 }
@@ -828,5 +1351,115 @@ mod tests {
         let result = GenusResult::default();
         assert!(result.genus.is_none());
         assert_eq!(result.confidence, 0.0);
+    }
+
+    fn lik(pairs: &[(&str, f64)]) -> FxHashMap<String, f64> {
+        pairs.iter().map(|(g, l)| (g.to_string(), *l)).collect()
+    }
+
+    #[test]
+    fn test_ou_posterior_no_neighbors_is_normalized_likelihood() {
+        // Empty distance map => every off-diagonal weight ≈ 0 => posterior is just the
+        // likelihoods renormalized (no phylogenetic smoothing).
+        let neighbors = FxHashMap::default();
+        let l = lik(&[("Escherichia", 3.0), ("Salmonella", 1.0)]);
+        let post = ou_posterior(&l, &neighbors, 0.1);
+        assert_eq!(post[0].0, "Escherichia");
+        // Not exactly 0.75/0.25: the absent pair still carries w=exp(-ABSENT_PATRISTIC/λ)=
+        // exp(-30)≈9e-14 of residual smoothing, which is the intended "≈0" degenerate limit.
+        assert!((post[0].1 - 0.75).abs() < 1e-3, "got {}", post[0].1);
+        assert!((post[1].1 - 0.25).abs() < 1e-3, "got {}", post[1].1);
+    }
+
+    #[test]
+    fn test_ou_posterior_borrows_from_close_relative() {
+        // Escherichia has all the likelihood; Salmonella has none but sits d=0.0406 away
+        // (same family, GTDB patristic), while Bacillus is far (absent => d=ABSENT_PATRISTIC).
+        // The kernel must lift Salmonella's posterior well above Bacillus's — borrowed by
+        // proximity.
+        let mut neighbors: FxHashMap<String, FxHashMap<String, f64>> = FxHashMap::default();
+        neighbors.entry("Escherichia".into()).or_default().insert("Salmonella".into(), 0.0406);
+        neighbors.entry("Salmonella".into()).or_default().insert("Escherichia".into(), 0.0406);
+        let l = lik(&[("Escherichia", 1.0), ("Salmonella", 0.0), ("Bacillus", 0.0)]);
+        let post = ou_posterior(&l, &neighbors, 0.3);
+        let p: FxHashMap<_, _> = post.into_iter().collect();
+        assert!(p["Salmonella"] > p["Bacillus"], "close relative must outrank far one");
+        assert!(p["Salmonella"] > 0.05, "Salmonella should borrow real mass, got {}", p["Salmonella"]);
+        assert!(p["Escherichia"] > p["Salmonella"], "the observed genus still leads");
+    }
+
+    fn ent(g: &str, fam: &str, gen: &str) -> (String, [String; 7]) {
+        // [superkingdom, phylum, class, order, family, genus, species]
+        (g.to_string(), [
+            "Bacteria".into(), "Pseudomonadota".into(), "Gammaproteobacteria".into(),
+            "Enterobacterales".into(), fam.into(), gen.into(), format!("{} sp.", gen),
+        ])
+    }
+
+    #[test]
+    fn test_lca_ragged_rank() {
+        let mut lin: FxHashMap<String, [String; 7]> = FxHashMap::default();
+        for (k, v) in [ent("Escherichia", "Enterobacteriaceae", "Escherichia"),
+                       ent("Salmonella", "Enterobacteriaceae", "Salmonella")] {
+            lin.insert(k, v);
+        }
+        lin.insert("Bacillus".into(), [
+            "Bacteria".into(), "Bacillota".into(), "Bacilli".into(), "Bacillales".into(),
+            "Bacillaceae".into(), "Bacillus".into(), "Bacillus subtilis".into(),
+        ]);
+        // Single genus → resolves to genus.
+        assert_eq!(lca_of(&["Escherichia"], &lin), ("genus".into(), "Escherichia".into()));
+        // Two Enterobacteriaceae genera → family LCA (the ragged-rank answer).
+        assert_eq!(lca_of(&["Escherichia", "Salmonella"], &lin),
+                   ("family".into(), "Enterobacteriaceae".into()));
+        // Across phyla → superkingdom.
+        assert_eq!(lca_of(&["Escherichia", "Bacillus"], &lin),
+                   ("superkingdom".into(), "Bacteria".into()));
+    }
+
+    #[test]
+    fn test_render_resolution_notation() {
+        // Single genus → that genus (radius irrelevant).
+        assert_eq!(render_resolution(&["Escherichia"], "genus", "Escherichia", 0.0),
+                   ("genus".into(), "Escherichia".into()));
+        // Tight cluster (small radius) → list the genera, NOT the family — coherence, not count.
+        assert_eq!(render_resolution(&["Escherichia", "Shigella"], "family", "Enterobacteriaceae", 0.03),
+                   ("genus".into(), "Escherichia|Shigella".into()));
+        // Many genera but still tight → still listed (count does NOT trigger rollup).
+        let tight_many = ["A", "B", "C", "D", "E", "F"];
+        assert_eq!(render_resolution(&tight_many, "family", "Enterobacteriaceae", 0.10),
+                   ("genus".into(), "A|B|C|D|E|F".into()));
+        // Two genera spread past the family diameter (radius > 0.5) → the family name.
+        assert_eq!(render_resolution(&["Escherichia", "Klebsiella"], "family", "Enterobacteriaceae", 0.6),
+                   ("family".into(), "Enterobacteriaceae".into()));
+        // Genera spanning families (large patristic radius, coarse LCA) → the LCA clade.
+        assert_eq!(render_resolution(&["Escherichia", "Bacillus"], "superkingdom", "Bacteria", 1.5),
+                   ("superkingdom".into(), "Bacteria".into()));
+    }
+
+    #[test]
+    fn test_group_credible_set_clusters_by_distance() {
+        // Escherichia+Pseudescherichia are tight (0.08 patristic); Cronobacter and Klebsiella
+        // sit >0.5 from them and from each other → three clusters. The tight pair (mass 0.55)
+        // leads; within it the higher-posterior genus is first.
+        let mut nb: FxHashMap<String, FxHashMap<String, f64>> = FxHashMap::default();
+        let mut set = |a: &str, b: &str, d: f64| {
+            nb.entry(a.into()).or_default().insert(b.into(), d);
+            nb.entry(b.into()).or_default().insert(a.into(), d);
+        };
+        set("Escherichia", "Pseudescherichia", 0.08);
+        set("Escherichia", "Cronobacter", 0.90);
+        set("Escherichia", "Klebsiella", 0.70);
+        set("Pseudescherichia", "Cronobacter", 0.90);
+        set("Pseudescherichia", "Klebsiella", 0.70);
+        set("Cronobacter", "Klebsiella", 0.80);
+        let members = vec![
+            ("Escherichia".to_string(), 0.30),
+            ("Cronobacter".to_string(), 0.25),
+            ("Pseudescherichia".to_string(), 0.25),
+            ("Klebsiella".to_string(), 0.20),
+        ];
+        let out = group_credible_set(&members, &nb, GENUS_COHERENCE_RADIUS);
+        assert_eq!(out, "Escherichia(0.30),Pseudescherichia(0.25) | Cronobacter(0.25) | Klebsiella(0.20)");
     }
 }

@@ -227,6 +227,19 @@ struct Args {
     #[arg(short = 'n', long, value_name = "BP", default_value = "1000", help_heading = "Genus Classification")]
     max_flanking: usize,
 
+    /// Cap on reference flanks aligned per locus [0 = unlimited]. A few genes carry up
+    /// to ~128k flanks; a positive cap speeds classification (evenly-strided sample) but
+    /// shifts the genus/species call on those heavy loci, so it is off (0) by default.
+    #[arg(long = "max-ref-flanks", value_name = "N", default_value = "0", help_heading = "Genus Classification")]
+    max_ref_flanks: usize,
+
+    /// Target coverage for the conformal credible set: the rate at which the true host's
+    /// clade must fall inside the reported Credible_Set. Higher = more certain but broader
+    /// answers (more genera, coarser Resolution_Rank). Picks the calibrated threshold from
+    /// the database's conformal.tsv; without that table the set is uncalibrated (0.9 mass).
+    #[arg(long = "target-coverage", value_name = "P", default_value = "0.90", help_heading = "Genus Classification")]
+    target_coverage: f64,
+
     // ===== ASSEMBLY & EXTENSION =====
     /// Minimum contig length to keep (bp)
     #[arg(short = 'g', long, value_name = "BP", default_value = "200", help_heading = "Assembly")]
@@ -405,6 +418,14 @@ struct Args {
     #[arg(skip)]
     bwa_mem2: String,
 
+    /// Path to blastn (auto-detected; --blastn-path overrides). Used for contig→ARG detection.
+    #[arg(skip)]
+    blastn: String,
+
+    /// Path to makeblastdb (auto-detected). Builds the ARG BLAST DB for detection.
+    #[arg(skip)]
+    makeblastdb: String,
+
     /// Resolved FASTA reference for alt mappers (set in main)
     #[arg(skip)]
     ref_fasta_resolved: Option<PathBuf>,
@@ -481,13 +502,21 @@ struct ResultRow {
     identity: f64,
     coverage: f64,
     contig_len: usize,
+    arg_start: usize,   // ARG span start on the contig (true coordinate, 0-based)
+    arg_end: usize,     // ARG span end on the contig (true coordinate)
     upstream_len: usize,
     downstream_len: usize,
     extension_method: String,  // "strict" (tadpole) or "flexible" (rust extender)
     top_matches: String,
-    snp_status: String,  // SNP verification status for point mutation ARGs
+    snp_status: String,  // SNP verification status (internal; not emitted in RAPID output)
     context: String,     // replicon context: plasmid / chromosome / ambiguous / NA
     species: String,     // species call (or multi-species(N):... / Unknown)
+    credible_set: String, // kernel credible set: "genusA(0.62);genusB(0.31)" to 0.9 mass
+    support: f64,        // posterior mass of the credible set (UNCALIBRATED)
+    resolution_distance: f64, // mash radius of the credible set (0 = single genus)
+    limited_by: String,  // query / biology / none
+    resolution_rank: String,  // LCA rank of the credible set (ragged: species..root)
+    resolution_taxon: String, // LCA taxon name (e.g. Enterobacteriaceae)
 }
 
 /// Formats the reported genus from a classification result. When several genera are
@@ -553,6 +582,10 @@ struct ArgHit {
     contig_start: usize,
     contig_end: usize,
     strand: char,
+    /// All PanRes reference IDs that tie at this locus (same identity & coverage as the
+    /// representative). These are redundant DB representations of the same physical gene;
+    /// classification unions their flanking reference sets so no source's evidence is lost.
+    members: Vec<String>,
 }
 
 /// Validate ARG database file format
@@ -1063,6 +1096,18 @@ fn main() -> Result<()> {
     // Auto-detect external tools
     args.minimap2 = find_executable("minimap2")?.to_string_lossy().to_string();
 
+    // Contig→ARG detection uses BLAST (dc-megablast); resolve blastn/makeblastdb the
+    // same way as the other tools — honour --blastn-path if given, else search PATH.
+    args.blastn = match &args.blastn_path {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => find_executable("blastn")?.to_string_lossy().to_string(),
+    };
+    args.makeblastdb = find_executable("makeblastdb")?.to_string_lossy().to_string();
+    if args.verbose {
+        eprintln!("Found blastn: {}", args.blastn);
+        eprintln!("Found makeblastdb: {}", args.makeblastdb);
+    }
+
     // --classify-contigs only needs minimap2 (detection + classification); skip the
     // assembly/mapper toolchain and the read pipeline entirely.
     if let Some(contigs_fa) = args.classify_contigs.clone() {
@@ -1425,8 +1470,9 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
     if args.verbose {
         eprintln!("  [4/6] Detecting ARGs...");
     }
-    let paf_contigs = run_minimap2_contigs(&contigs_path, args.arg_db.as_ref().unwrap(), &sample_dir, &args.minimap2, args.threads)?;
-    let arg_hits = detect_args(&paf_contigs, args.arg_identity, args.arg_coverage)?;
+    let arg_hits = detect_args_blast(&contigs_path, args.arg_db.as_ref().unwrap(), &sample_dir,
+                                     &args.blastn, &args.makeblastdb,
+                                     args.arg_identity, args.arg_coverage, args.threads)?;
     let unique_args = deduplicate_args(arg_hits);
 
     if unique_args.is_empty() {
@@ -1557,6 +1603,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                         for sc in &sl.contigs {
                             recs.push(FastaRecord { name: sc.name.clone(), seq: sc.seq.clone() });
                             hits.push(ArgHit {
+                                members: vec![sl.arg_name.clone()],
                                 arg_name: sl.arg_name.clone(),
                                 arg_class: sl.arg_class.clone(),
                                 contig: sc.name.clone(),
@@ -1658,6 +1705,8 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                 identity: hit.identity,
                 coverage: hit.coverage,
                 contig_len: hit.contig_len,
+                arg_start: hit.contig_start,
+                arg_end: hit.contig_end,
                 upstream_len: genus_info.upstream_len,
                 downstream_len: genus_info.downstream_len,
                 extension_method: ext_method.to_string(),
@@ -1665,6 +1714,16 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                 snp_status: format!("{}", genus_info.snp_status),
                 context: genus_info.context.clone(),
                 species: format_species_call(&genus_info),
+                credible_set: if genus_info.credible_set_grouped.is_empty() {
+                    "NA".to_string()
+                } else {
+                    genus_info.credible_set_grouped.clone()
+                },
+                support: genus_info.support,
+                resolution_distance: genus_info.resolution_distance,
+                limited_by: genus_info.limited_by.clone(),
+                resolution_rank: genus_info.resolution_rank.clone(),
+                resolution_taxon: genus_info.resolution_taxon.clone(),
             }
         })
         .collect();
@@ -1712,6 +1771,7 @@ fn classify_genera(
                 arg_start: hit.contig_start,
                 arg_end: hit.contig_end,
                 strand: hit.strand,
+                members: if hit.members.is_empty() { vec![hit.arg_name.clone()] } else { hit.members.clone() },
             })
         })
         .collect();
@@ -1759,6 +1819,13 @@ fn classify_genera(
                     species: None,
                     species_top_matches: vec![],
                     n_species_tied: 0,
+                    credible_set: vec![],
+                    support: 0.0,
+                    resolution_distance: 0.0,
+                    limited_by: "none".to_string(),
+                    resolution_rank: "NA".to_string(),
+                    resolution_taxon: "NA".to_string(),
+                    credible_set_grouped: String::new(),
                 }
             })
             .collect();
@@ -1779,13 +1846,15 @@ fn classify_genera(
         args.species_map.as_deref(),
         args.context_plasmid_frac,
         args.context_chromosome_frac,
+        args.max_ref_flanks,
+        args.target_coverage,
     )?;
 
     classifier.classify_batch(&positions, args.threads)
 }
 
 fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
-    let header = "Sample\tContig_ID\tARG_Name\tARG_Class\tGenus\tSpecies\tConfidence\tSpecificity\tContext\tARG_Identity\tARG_Coverage\tContig_Len\tUpstream_Len\tDownstream_Len\tExtension_Method\tSNP_Status\tTop_Matches";
+    let header = "Sample\tContig_ID\tARG_Name\tARG_Class\tGenus\tSpecies\tConfidence\tSpecificity\tContext\tARG_Identity\tARG_Coverage\tContig_Len\tARG_Start\tARG_End\tUpstream_Len\tDownstream_Len\tExtension_Method\tTop_Matches\tCredible_Set\tResolution_Rank\tResolution_Taxon\tSupport\tResolution_Distance\tLimited_By";
 
     // By default, filter out WildType and NotCovered (not true resistance genes)
     // WildType: SNP position checked but found wild-type allele (no resistance mutation)
@@ -1810,7 +1879,7 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
     for r in &output_results {
         writeln!(
             output,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}",
             r.sample,
             r.contig_id,
             r.arg_name,
@@ -1823,11 +1892,18 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
             r.identity,
             r.coverage,
             r.contig_len,
+            r.arg_start,
+            r.arg_end,
             r.upstream_len,
             r.downstream_len,
             r.extension_method,
-            r.snp_status,
-            r.top_matches
+            r.top_matches,
+            r.credible_set,
+            r.resolution_rank,
+            r.resolution_taxon,
+            r.support,
+            r.resolution_distance,
+            r.limited_by
         )?;
     }
 
@@ -2829,8 +2905,9 @@ fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
     let contigs_path = sample_dir.join("contigs_input.fasta");
     write_contigs_simple(&contigs, &contigs_path)?;
 
-    let paf_contigs = run_minimap2_contigs(&contigs_path, args.arg_db.as_ref().unwrap(), &sample_dir, &args.minimap2, args.threads)?;
-    let arg_hits = detect_args(&paf_contigs, args.arg_identity, args.arg_coverage)?;
+    let arg_hits = detect_args_blast(&contigs_path, args.arg_db.as_ref().unwrap(), &sample_dir,
+                                     &args.blastn, &args.makeblastdb,
+                                     args.arg_identity, args.arg_coverage, args.threads)?;
     let unique_args = deduplicate_args(arg_hits);
     if args.verbose {
         eprintln!("[classify-contigs] ARGs detected: {}", unique_args.len());
@@ -2862,6 +2939,8 @@ fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
             identity: hit.identity,
             coverage: hit.coverage,
             contig_len: hit.contig_len,
+            arg_start: hit.contig_start,
+            arg_end: hit.contig_end,
             upstream_len: g.upstream_len,
             downstream_len: g.downstream_len,
             extension_method: "classify".to_string(),
@@ -2869,6 +2948,16 @@ fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
             snp_status: format!("{}", g.snp_status),
             context: g.context.clone(),
             species: species_call,
+            credible_set: if g.credible_set_grouped.is_empty() {
+                "NA".to_string()
+            } else {
+                g.credible_set_grouped.clone()
+            },
+            support: g.support,
+            resolution_distance: g.resolution_distance,
+            limited_by: g.limited_by.clone(),
+            resolution_rank: g.resolution_rank.clone(),
+            resolution_taxon: g.resolution_taxon.clone(),
         }
     }).collect();
 
@@ -2891,66 +2980,255 @@ fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn run_minimap2_contigs(contigs: &Path, db: &Path, output_dir: &Path, minimap2: &str, threads: usize) -> Result<PathBuf> {
-    let paf_path = output_dir.join("contigs_to_argdb.paf");
-
-    Command::new(minimap2)
-        .args(["-x", "asm20", "-t", &threads.to_string(), "-c"])
-        .arg(db).arg(contigs).arg("-o").arg(&paf_path)
-        .stderr(std::process::Stdio::null())
-        .status().context("Failed to run minimap2")?;
-
-    Ok(paf_path)
-}
-
-fn detect_args(paf_path: &Path, min_identity: f64, min_coverage: f64) -> Result<Vec<ArgHit>> {
-    let mut hits = Vec::new();
+/// Detect ARGs by aligning assembled contigs against the ARG reference FASTA with
+/// BLAST (dc-megablast), the standard for assembly-based ARG detection (ResFinder
+/// FASTA path, abricate, AMRFinderPlus all use blastn). Replaces the earlier minimap2
+/// step: minimap2 is a best-placement mapper whose chaining silently drops short genes
+/// packed in integrons/cassettes (e.g. dfrA12) and divergent hits; a benchmark over
+/// 1000+ GTDB genomes showed minimap2 recovering only ~62% (asm20) / 97% (sensitive) of
+/// BLAST's loci at equal cost. dc-megablast's spaced (discontiguous) seed keeps
+/// sensitivity across the ~80–95% cross-species regime that plain megablast misses.
+///
+/// HSPs of the same reference sitting close on a contig are merged into one locus before
+/// the coverage/identity filter, so a gene split into several HSPs is not lost. Redundant
+/// hits (PanRes maps one gene to many near-identical refs) are collapsed later by
+/// deduplicate_args().
+fn detect_args_blast(
+    contigs: &Path,
+    arg_db_fasta: &Path,
+    output_dir: &Path,
+    blastn: &str,
+    makeblastdb: &str,
+    min_identity: f64,
+    min_coverage: f64,
+    threads: usize,
+) -> Result<Vec<ArgHit>> {
+    use std::collections::HashMap;
     let min_identity_pct = min_identity * 100.0;
     let min_coverage_pct = min_coverage * 100.0;
 
-    let reader = PafReader::open(paf_path)?;
-    for record in reader {
-        let rec = record?;
-        let identity = rec.calculate_identity();
-        let coverage = rec.calculate_coverage();
-
-        if identity >= min_identity_pct && coverage >= min_coverage_pct {
-            let parts: Vec<&str> = rec.target_name.split('|').collect();
-            let arg_name = parts.first().unwrap_or(&"").to_string();
-            let arg_class = parts.get(1).unwrap_or(&"UNKNOWN").to_string();
-
-            hits.push(ArgHit {
-                arg_name,
-                arg_class,
-                contig: rec.query_name,
-                contig_len: rec.query_len,
-                identity,
-                coverage,
-                contig_start: rec.query_start,
-                contig_end: rec.query_end,
-                strand: rec.strand,
-            });
-        }
+    // Build a nucleotide BLAST DB from the ARG reference FASTA (PanRes ~0.05s). Rebuilt
+    // per run into the sample dir to avoid stale/locked shared-DB files.
+    let db_prefix = output_dir.join("argdb_blast");
+    let status = Command::new(makeblastdb)
+        .args(["-in", arg_db_fasta.to_str().unwrap(), "-dbtype", "nucl",
+               "-out", db_prefix.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("Failed to run makeblastdb on {}", arg_db_fasta.display()))?;
+    if !status.success() {
+        anyhow::bail!("makeblastdb failed on {} — BLAST detection needs the ARG FASTA (e.g. PanRes_genes_v1.0.0.fa), not an .mmi", arg_db_fasta.display());
     }
 
+    // -max_target_seqs is intentionally huge: PanRes is highly redundant, so one
+    // chromosome matches thousands of near-identical entries and a low cap silently
+    // truncates real genes (a low cap caused ~4x undercounting in benchmarking).
+    let out = output_dir.join("contigs_to_argdb.blast6");
+    let perc = format!("{}", min_identity_pct);
+    let status = Command::new(blastn)
+        .args(["-task", "dc-megablast",
+               "-query", contigs.to_str().unwrap(),
+               "-db", db_prefix.to_str().unwrap(),
+               "-outfmt", "6 qseqid qlen sseqid slen pident length qstart qend sstart send",
+               "-perc_identity", &perc,
+               "-max_target_seqs", "100000",
+               "-evalue", "1e-10",
+               "-num_threads", &threads.to_string(),
+               "-out", out.to_str().unwrap()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("Failed to run blastn (dc-megablast)")?;
+    if !status.success() {
+        anyhow::bail!("blastn (dc-megablast) failed");
+    }
+
+    // Group HSPs by (contig, reference), then merge those close on the contig into one
+    // physical locus before applying the coverage/identity filter.
+    struct Hsp { qs: usize, qe: usize, ss: usize, se: usize, fwd: bool, matches: f64, alen: usize }
+    let mut groups: HashMap<(String, String), (usize, usize, Vec<Hsp>)> = HashMap::new();
+    let content = std::fs::read_to_string(&out)
+        .with_context(|| format!("Failed to read {}", out.display()))?;
+    for line in content.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 10 { continue; }
+        let qlen: usize = f[1].parse().unwrap_or(0);
+        let slen: usize = f[3].parse().unwrap_or(0);
+        let pident: f64 = f[4].parse().unwrap_or(0.0);
+        let length: usize = f[5].parse().unwrap_or(0);
+        let qstart: usize = f[6].parse().unwrap_or(0);
+        let qend: usize = f[7].parse().unwrap_or(0);
+        let sstart: usize = f[8].parse().unwrap_or(0);
+        let send: usize = f[9].parse().unwrap_or(0);
+        if slen == 0 || length == 0 { continue; }
+        let entry = groups.entry((f[0].to_string(), f[2].to_string()))
+            .or_insert((qlen, slen, Vec::new()));
+        entry.2.push(Hsp {
+            qs: qstart.min(qend), qe: qstart.max(qend),
+            ss: sstart.min(send), se: sstart.max(send),
+            fwd: sstart <= send,
+            matches: pident / 100.0 * length as f64,
+            alen: length,
+        });
+    }
+
+    let mut hits = Vec::new();
+    for ((contig, refname), (qlen, slen, mut hsps)) in groups {
+        hsps.sort_by_key(|h| h.qs);
+        let mut i = 0;
+        while i < hsps.len() {
+            let mut j = i + 1;
+            let mut cluster_end = hsps[i].qe;
+            while j < hsps.len() && hsps[j].qs.saturating_sub(cluster_end) < slen {
+                cluster_end = cluster_end.max(hsps[j].qe);
+                j += 1;
+            }
+            let cluster = &hsps[i..j];
+            // union of reference-covered intervals → true coverage across merged HSPs
+            let mut ivs: Vec<(usize, usize)> = cluster.iter().map(|h| (h.ss, h.se)).collect();
+            ivs.sort();
+            let (mut cs, mut ce) = ivs[0];
+            let mut cov = 0usize;
+            for &(s, e) in &ivs[1..] {
+                if s <= ce + 1 { ce = ce.max(e); }
+                else { cov += ce - cs + 1; cs = s; ce = e; }
+            }
+            cov += ce - cs + 1;
+            let refcov = cov as f64 / slen as f64 * 100.0;
+            let sum_matches: f64 = cluster.iter().map(|h| h.matches).sum();
+            let sum_alen: usize = cluster.iter().map(|h| h.alen).sum();
+            let identity = if sum_alen > 0 { sum_matches / sum_alen as f64 * 100.0 } else { 0.0 };
+            if refcov >= min_coverage_pct && identity >= min_identity_pct {
+                let gstart = cluster.iter().map(|h| h.qs).min().unwrap();
+                let gend = cluster.iter().map(|h| h.qe).max().unwrap();
+                let fwd = cluster.iter().filter(|h| h.fwd).count() * 2 >= cluster.len();
+                let parts: Vec<&str> = refname.split('|').collect();
+                let arg_name = parts.first().unwrap_or(&"").to_string();
+                hits.push(ArgHit {
+                    members: vec![arg_name.clone()],
+                    arg_name,
+                    arg_class: parts.get(1).unwrap_or(&"UNKNOWN").to_string(),
+                    contig: contig.clone(),
+                    contig_len: qlen,
+                    identity,
+                    coverage: refcov,
+                    contig_start: gstart.saturating_sub(1), // BLAST 1-based → 0-based half-open (matches old minimap2 coords)
+                    contig_end: gend,
+                    strand: if fwd { '+' } else { '-' },
+                });
+            }
+            i = j;
+        }
+    }
+    // Deterministic order: groups come from a HashMap (random iteration order), so sort
+    // before returning. Otherwise, when several redundant PanRes refs tie at one locus
+    // (same coords/identity/coverage), which one deduplicate_args keeps as the
+    // representative would vary run-to-run. Final key = arg_name for a stable tiebreak.
+    hits.sort_by(|a, b| a.contig.cmp(&b.contig)
+        .then(a.contig_start.cmp(&b.contig_start))
+        .then(a.contig_end.cmp(&b.contig_end))
+        .then(a.arg_name.cmp(&b.arg_name)));
     Ok(hits)
 }
 
-fn deduplicate_args(hits: Vec<ArgHit>) -> Vec<ArgHit> {
-    let mut best: HashMap<String, ArgHit> = HashMap::new();
-
-    for hit in hits {
-        let key = hit.arg_name.clone();
-        if let Some(existing) = best.get(&key) {
-            if hit.identity > existing.identity {
-                best.insert(key, hit);
-            }
-        } else {
-            best.insert(key, hit);
+/// Collapse redundant ARG hits that map to the SAME physical locus into one row.
+///
+/// A redundant, multi-source reference DB (e.g. PanRes aggregates ResFinder + CARD +
+/// AMRFinder + MEGARes + …) makes one gene copy align to many near-identical reference
+/// entries; each surfaces as a separate hit at ~the same contig coordinates. Keying on
+/// the reference/gene name (as before) does NOT collapse these — every variant is a
+/// distinct name. We instead group by contig + overlapping ARG span using the TRUE
+/// contig coordinates (not the max-flanking-capped upstream/downstream lengths, which
+/// are unreliable for this) and keep the single best representative per locus.
+///
+/// Distinct genes on one contig (e.g. an integron cassette: sul1 + aadA2 + dfrA12) sit
+/// at different, non-overlapping spans and therefore remain SEPARATE loci.
+fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
+    // Representative preference within a locus: higher identity, then higher coverage,
+    // then the SHORTER span. Shorter wins the final tie so a tight, gene-length allele
+    // is chosen over a padded consensus reference (e.g. a MEGARes entry longer than the
+    // gene), keeping the reported ARG_Start/End close to the true gene boundary. A real
+    // partial fragment is already beaten earlier on coverage, so "shorter" here is safe.
+    fn better(a: &ArgHit, b: &ArgHit) -> bool {
+        use std::cmp::Ordering::{Greater, Less};
+        match a.identity.partial_cmp(&b.identity) {
+            Some(Greater) => return true,
+            Some(Less) => return false,
+            _ => {}
         }
+        match a.coverage.partial_cmp(&b.coverage) {
+            Some(Greater) => return true,
+            Some(Less) => return false,
+            _ => {}
+        }
+        let sa = a.contig_end.saturating_sub(a.contig_start);
+        let sb = b.contig_end.saturating_sub(b.contig_start);
+        sa < sb
     }
 
-    let mut result: Vec<ArgHit> = best.into_values().collect();
+    // Finalize an open locus: keep the same representative as before, and additionally
+    // record the member IDs of every ref TIED with it (equal identity AND coverage) —
+    // the redundant PanRes representations of the same physical gene. Their flanking
+    // reference sets are unioned at classification time so no source DB's evidence is
+    // dropped. Lower-identity overlapping refs (more divergent genes) are not merged.
+    fn finalize(group: Vec<ArgHit>) -> ArgHit {
+        let mut best = 0;
+        for i in 1..group.len() {
+            if better(&group[i], &group[best]) { best = i; }
+        }
+        let (rid, rcov) = (group[best].identity, group[best].coverage);
+        let mut members: Vec<String> = Vec::new();
+        for h in &group {
+            if (h.identity - rid).abs() < 1e-9 && (h.coverage - rcov).abs() < 1e-9 {
+                for m in &h.members {
+                    if !members.contains(m) { members.push(m.clone()); }
+                }
+            }
+        }
+        members.sort();
+        let mut out = group.into_iter().nth(best).unwrap();
+        out.members = members;
+        out
+    }
+
+    hits.sort_by(|a, b| {
+        a.contig.cmp(&b.contig)
+            .then(a.contig_start.cmp(&b.contig_start))
+            .then(b.contig_end.cmp(&a.contig_end))
+    });
+
+    let mut result: Vec<ArgHit> = Vec::new();
+    let mut group: Vec<ArgHit> = Vec::new(); // all hits of the currently open locus
+    let mut rep: Option<ArgHit> = None;      // best-so-far of the open locus (overlap test)
+    for hit in hits {
+        // Same locus iff same contig and ≥50% reciprocal overlap (of the shorter span)
+        // with the current representative. Same-gene variants share ~identical spans;
+        // a neighbouring cassette gene barely overlaps → opens a new locus.
+        let same = match &rep {
+            Some(r) if r.contig == hit.contig => {
+                let ov = hit.contig_start.max(r.contig_start);
+                let oe = hit.contig_end.min(r.contig_end);
+                let overlap = oe.saturating_sub(ov);
+                let shorter = (hit.contig_end.saturating_sub(hit.contig_start))
+                    .min(r.contig_end.saturating_sub(r.contig_start))
+                    .max(1);
+                overlap * 2 >= shorter
+            }
+            _ => false,
+        };
+        if !same {
+            if !group.is_empty() { result.push(finalize(std::mem::take(&mut group))); }
+            rep = None;
+        }
+        if rep.as_ref().map_or(true, |r| better(&hit, r)) {
+            rep = Some(hit.clone());
+        }
+        group.push(hit);
+    }
+    if !group.is_empty() {
+        result.push(finalize(group));
+    }
+
     result.sort_by(|a, b| b.coverage.partial_cmp(&a.coverage).unwrap_or(std::cmp::Ordering::Equal));
     result
 }

@@ -44,7 +44,11 @@ use std::path::Path;
 ///
 /// Contains the 12 mandatory PAF columns parsed from a single line.
 /// Optional tags (columns 13+) are not currently parsed.
+// A complete 12-column PAF record. The read-filter path consumes only a subset
+// (query_name/target fields + block_len via calculate_identity); the remaining
+// columns are still parsed so the record is a faithful representation of the line.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PafRecord {
     /// Query sequence name (column 1).
     pub query_name: String,
@@ -123,6 +127,7 @@ impl PafRecord {
     ///
     /// # Returns
     /// Coverage percentage (0-100), or 0 if target_len is 0.
+    #[allow(dead_code)]
     pub fn calculate_coverage(&self) -> f64 {
         if self.target_len == 0 {
             return 0.0;

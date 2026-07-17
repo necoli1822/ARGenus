@@ -2,6 +2,28 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.4.0] - 2026-07-17
+
+### Added
+
+- **Self-contained binary: embedded GTDB phylogenetic-context tables.** The GTDB
+  genus distance/lineage tables and the conformal calibration are now embedded in
+  the binary (zstd-compressed, `src/embedded/`), so a built binary is self-contained
+  — only the flanking DB (FDB) is downloaded separately. This eliminates "old table
+  + new constant" version drift: the kernel constants (λ=0.3, coherence radius 0.5,
+  absent-patristic 3.0) are calibrated to the embedded GTDB patristic scale and ship
+  together. A `genus_dist.tsv`/`genus_lineage.tsv`/`conformal.tsv` in the db dir still
+  overrides the embedded copy when present.
+
+### Changed
+
+- **Kernel-posterior genus/family classification.** Reworked the phylogenetic-context
+  scoring toward a posterior over lineages. Validated with no regression and net
+  improvement: Zymo genus-wrong 5.8→4.3%, GTDB (7,077 genomes) family 91.1→92.2% /
+  genus-wrong 14.4→12.6%, RAPID (775 MAGs) detection 98.7% byte-identical with host
+  Bracken corroboration 90.3→93.4%. Detection specificity unchanged (ResFinder golden:
+  recall 99.9%, ARG-negative specificity 99.5%).
+
 ## [0.3.1] - 2026-07-12
 
 ### Changed

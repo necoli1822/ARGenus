@@ -1,6 +1,6 @@
 [package]
 name = "ARGenus"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "ARG detection and genus-level classification using flanking sequence analysis"
 authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]
@@ -15,6 +15,7 @@ categories = ["science", "command-line-utilities"]
 # databases, manuscripts, etc.).
 include = [
     "src/**/*.rs",
+    "src/embedded/*.zst",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
