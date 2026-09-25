@@ -213,7 +213,8 @@ fn split_reads(
         // choose the locus this pair belongs to
         let locus = match (o1, o2) {
             (Some((l1, c1)), Some((l2, c2))) => {
-                if l1 == l2 { Some(l1) } else if c1 >= c2 { Some(l1) } else { Some(l2) }
+                // same locus, or the mate with better coverage picks it
+                if l1 == l2 || c1 >= c2 { Some(l1) } else { Some(l2) }
             }
             (Some((l1, _)), None) => Some(l1),
             (None, Some((l2, _))) => Some(l2),
@@ -223,8 +224,8 @@ fn split_reads(
             Some(l) => l,
             None => continue,
         };
-        let r1core = o1.map_or(false, |(li, cv)| li == l && cv >= core);
-        let r2core = o2.map_or(false, |(li, cv)| li == l && cv >= core);
+        let r1core = o1.is_some_and(|(li, cv)| li == l && cv >= core);
+        let r2core = o2.is_some_and(|(li, cv)| li == l && cv >= core);
         if r1core && r2core {
             continue; // both core: shared bridge — drop
         } else if r1core {

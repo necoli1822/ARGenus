@@ -145,8 +145,22 @@ pub struct GenusResult {
     /// Mash radius of the credible set: max distance from its medoid to any member. 0 for
     /// a single-genus call; larger = the shared context spans a broader clade.
     pub resolution_distance: f64,
-    /// Why resolution stopped: "query" (flank truncated by the contig edge), "biology"
-    /// (full flank but context genuinely shared across genera), or "none" (single genus).
+    /// Why resolution stopped. When a genus WAS called: "none" (single genus),
+    /// "flank_truncated" (the contig edge cut the flank short) or "flank_shared" (full
+    /// flank recovered, but the context is genuinely shared across genera). The last two
+    /// were named "query"/"biology" up to and including v0.4.0; those said what the cause
+    /// was categorised as, not what a reader would look for in the output.
+    ///
+    /// When Genus is Unknown this says why, and the reasons are not interchangeable:
+    /// "no_context" (align-path row — no contig, so context was never attempted),
+    /// "flank_too_short" (contig gave < 50 bp of flank on both sides),
+    /// "gene_not_in_reference" (the flanking DB holds nothing for this gene — no amount
+    /// of sequencing fixes it), "context_unmatched" (the DB holds the gene but none of
+    /// its reference flanks matched this sample — a novel or absent host),
+    /// "alignment_failed" (minimap2 errored) and "no_flanking_db" (run without a DB).
+    /// Before this change every one of these reported "none", which also means
+    /// "confidently one genus" — so a row with no answer was indistinguishable from the
+    /// most confident row in the file.
     pub limited_by: String,
     /// Ragged rank of the answer: the LCA rank of the credible set (species/genus/family/
     /// …/root). This is the taxonomic level at which the ARG's context is actually shared.
@@ -461,6 +475,7 @@ const GENUS_COHERENCE_RADIUS: f64 = 0.5;
 ///     cluster of close genera, named individually (strictly more specific than the family)
 ///   - several genera, radius spread → (LCA rank, LCA taxon) — the genera fan out across a
 ///     family/order/…, so the clade name is the honest summary
+///
 /// {Escherichia, Shigella} (radius ≈0.03) lists both genera; a set fanning across
 /// Enterobacteriaceae (radius ≈0.17) reports "Enterobacteriaceae" even if it's only 2 genera.
 fn render_resolution(members: &[&str], lca_rank: &str, lca_taxon: &str, radius: f64)
@@ -614,6 +629,15 @@ const DEFAULT_CREDIBLE_MASS: f64 = 0.9;
 const LINEAGE_RANKS: [&str; 7] =
     ["superkingdom", "phylum", "class", "order", "family", "genus", "species"];
 
+/// What one PAF of flanking alignments yields: per-genus mean likelihood, per-genus mean
+/// identity, the plasmid fraction of the matched references, and per-species mean identity.
+type GenusScores = (
+    FxHashMap<String, f64>,
+    FxHashMap<String, f64>,
+    f64,
+    FxHashMap<String, f64>,
+);
+
 impl GenusClassifier {
     /// Creates a new genus classifier.
     ///
@@ -623,6 +647,7 @@ impl GenusClassifier {
     /// * `min_identity` - Minimum alignment identity (0-1)
     /// * `min_align_len` - Minimum alignment length in bp
     /// * `max_flanking` - Maximum flanking length to extract
+    #[allow(clippy::too_many_arguments)]
     pub fn new<P: AsRef<Path>>(
         db_path: P,
         minimap2_path: &str,
@@ -864,7 +889,7 @@ impl GenusClassifier {
                 credible_set: vec![],
                 support: 0.0,
                 resolution_distance: 0.0,
-                limited_by: "none".to_string(),
+                limited_by: "flank_too_short".to_string(),
                 resolution_rank: "NA".to_string(),
                 resolution_taxon: "NA".to_string(),
                 credible_set_grouped: String::new(),
@@ -893,7 +918,7 @@ impl GenusClassifier {
                 credible_set: vec![],
                 support: 0.0,
                 resolution_distance: 0.0,
-                limited_by: "none".to_string(),
+                limited_by: "gene_not_in_reference".to_string(),
                 resolution_rank: "NA".to_string(),
                 resolution_taxon: "NA".to_string(),
                 credible_set_grouped: String::new(),
@@ -936,7 +961,7 @@ impl GenusClassifier {
                 credible_set: vec![],
                 support: 0.0,
                 resolution_distance: 0.0,
-                limited_by: "none".to_string(),
+                limited_by: "gene_not_in_reference".to_string(),
                 resolution_rank: "NA".to_string(),
                 resolution_taxon: "NA".to_string(),
                 credible_set_grouped: String::new(),
@@ -1019,7 +1044,7 @@ impl GenusClassifier {
                 credible_set: vec![],
                 support: 0.0,
                 resolution_distance: 0.0,
-                limited_by: "none".to_string(),
+                limited_by: "alignment_failed".to_string(),
                 resolution_rank: "NA".to_string(),
                 resolution_taxon: "NA".to_string(),
                 credible_set_grouped: String::new(),
@@ -1112,17 +1137,23 @@ impl GenusClassifier {
                 .fold(0.0f64, f64::max)
         };
 
-        // Limited-by: was resolution capped by the query (contig edge cut the flank) or by
-        // biology (full flank, but the context is genuinely shared across genera)?
+        // Limited-by: was resolution capped because the contig edge cut the flank short
+        // (flank_truncated), or because the full flank is genuinely shared across genera
+        // (flank_shared)? The distinction matters: the first is fixable with deeper
+        // sequencing or better assembly, the second is not.
         let reach_up = pos.arg_start.min(self.max_flanking);
         let reach_dn = pos.contig_len.saturating_sub(pos.arg_end).min(self.max_flanking);
         let contig_limited = reach_up < self.max_flanking || reach_dn < self.max_flanking;
-        let limited_by = if credible_set.len() < 2 {
+        let limited_by = if credible_set.is_empty() {
+            // No reference flank matched at all: the gene is in the reference but this
+            // sample's context is not. Distinct from "none" (a confident single genus).
+            "context_unmatched".to_string()
+        } else if credible_set.len() < 2 {
             "none".to_string()
         } else if contig_limited {
-            "query".to_string()
+            "flank_truncated".to_string()
         } else {
-            "biology".to_string()
+            "flank_shared".to_string()
         };
 
         // Ragged rank: the LCA of the credible set is the taxonomic level at which this
@@ -1218,8 +1249,7 @@ impl GenusClassifier {
     /// Parses the PAF and returns per-genus (mean likelihood, mean identity), the plasmid
     /// fraction, and per-species mean identity. The kernel posterior consumes the
     /// likelihoods; the identities feed confidence/context (kept on the 0-100 scale).
-    fn calculate_genus_scores(&self, paf_path: &Path)
-        -> Result<(FxHashMap<String, f64>, FxHashMap<String, f64>, f64, FxHashMap<String, f64>)> {
+    fn calculate_genus_scores(&self, paf_path: &Path) -> Result<GenusScores> {
         let file = File::open(paf_path)?;
         let reader = BufReader::new(file);
 

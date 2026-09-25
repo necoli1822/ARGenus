@@ -11,6 +11,36 @@ the gene on the assembled contig. Unlike tools that only detect ARGs, ARGenus li
 each ARG to a genus (and, when the flanking is specific enough, a species) and tells
 you how much to trust that link.
 
+## What's new in 0.4.1
+
+- **ARGs the assembly lost are now reported (on by default).** When a gene is broken
+  across contigs it fails the coverage floor and used to vanish from `results.tsv`, even
+  though the read→ARG alignment had already seen it. Those genes now appear as
+  **align-path rows** (`Detection_Path` = `align`). They carry no flanking, so they are
+  never attributed — `Genus`/`Species`/`Context` stay `Unknown` and `Limited_By` is
+  `no_context`; the read evidence is in `Top_Matches`. This means a 0.4.1 run can report
+  more rows than 0.4.0 on the same data; `--align-path off` restores the old behaviour.
+- **`Limited_By` says why a row is `Unknown`.** Previously every unresolved row
+  reported `none` — the same value a confident single-genus call reports. Unknown rows
+  now name their cause (`gene_not_in_reference`, `context_unmatched`,
+  `flank_too_short`, …), so you can tell whether more sequencing would help or only a
+  larger reference would.
+- **Per-variant SNP/INDEL counts.** `N_SNP`, `N_INDEL`, `INDEL_bp` and `Variants` are
+  parsed from the blastn traceback and reported for every hit. ARGenus does not use
+  them to accept or reject a call; they are there so you can judge point-mutation
+  resistance genes yourself.
+
+## What's new in 0.4.0
+
+- **Self-contained binary.** The GTDB genus distance/lineage tables and the conformal
+  calibration are embedded in the binary, so only the flanking DB is downloaded
+  separately and the kernel constants always match the table scale they were calibrated
+  to. A `genus_dist.tsv` / `genus_lineage.tsv` / `conformal.tsv` in the db dir still
+  overrides the embedded copy.
+- **Kernel-posterior genus/family classification.** Zymo genus-wrong 5.8→4.3%, GTDB
+  (7,077 genomes) family 91.1→92.2% / genus-wrong 14.4→12.6%, RAPID (775 MAGs) detection
+  98.7% byte-identical. Detection specificity unchanged.
+
 ## What's new in 0.3.1
 
 - **`--db-dir` picks one flanking DB unambiguously.** If a database folder holds more
@@ -197,6 +227,9 @@ Results are written to `results/results.tsv`.
 | `--ref-fasta <FILE>` | derived | FASTA reference for strobealign/bwa-mem2 |
 | `-i, --arg-identity <F>` | `0.80` | Min identity for ARG detection |
 | `-c, --arg-coverage <F>` | `0.70` | Min coverage for ARG detection |
+| `--align-path <on\|off>` | `on` | Also report ARGs seen only in the read alignment (never attributed) |
+| `--align-min-breadth <F>` | `0.80` | Min read-covered reference breadth for an align-path row |
+| `--align-min-reads <N>` | `10` | Min aligned reads for an align-path row |
 | `-n, --max-flanking <BP>` | `1000` | Flanking length used for classification |
 | `-u, --keep-temp` | off | Keep per-sample intermediates |
 | `-v, --verbose` | off | Progress to stderr |
@@ -227,7 +260,7 @@ Run `argenus --help` for the complete list.
 
 ## Output format (`results.tsv`)
 
-Tab-delimited, one row per ARG locus:
+Tab-delimited, one row per ARG locus (29 columns):
 
 | Column | Description |
 |--------|-------------|
@@ -240,18 +273,50 @@ Tab-delimited, one row per ARG locus:
 | Confidence | Mean flanking identity of the call |
 | Specificity | Gene-specificity (breadth) of the flanking evidence |
 | **Context** | `plasmid` / `chromosome` / `ambiguous` / `NA` |
-| ARG_Identity | ARG sequence identity |
-| ARG_Coverage | ARG sequence coverage |
+| ARG_Identity | ARG sequence identity (`0.0` on align-path rows — there is no contig alignment to score) |
+| ARG_Coverage | ARG sequence coverage; on align-path rows this is read-covered reference breadth |
 | Contig_Len | Assembled contig length |
-| Upstream_Len | Upstream flanking length |
-| Downstream_Len | Downstream flanking length |
+| ARG_Start / ARG_End | ARG position on the contig |
+| Upstream_Len / Downstream_Len | Flanking length recovered on each side |
 | Extension_Method | `strict` / `flexible` / `reassemble` |
-| SNP_Status | SNP verification status (point-mutation ARGs) |
 | Top_Matches | Top genus candidates with scores |
+| **Credible_Set** | Genera whose posterior mass reaches the conformal threshold |
+| **Resolution_Rank** | Rank the evidence supports — `genus`, `family`, `order`, … |
+| **Resolution_Taxon** | Taxon name at `Resolution_Rank` |
+| Support | Posterior mass of the credible set |
+| Resolution_Distance | Mash radius of the credible set |
+| **Limited_By** | Why resolution stopped — see below |
+| Detection_Path | `assembly`, or `align` for a read-only row that carries no flanking |
+| **N_SNP / N_INDEL / INDEL_bp** | Substitutions and gaps against the reference allele |
+| **Variants** | The substitutions themselves, in reference coordinates |
+
+### `Limited_By`
+
+On rows that called a genus:
+
+| Value | Meaning |
+|---|---|
+| `none` | A single genus — nothing limited it |
+| `flank_truncated` | The contig edge cut the flank short; deeper data may help |
+| `flank_shared` | Full flank recovered, but the context is genuinely shared across genera |
+
+> `flank_truncated` and `flank_shared` were called `query` and `biology` up to 0.4.0.
+
+On rows where `Genus` is `Unknown`, the cause is named, because the remedies differ:
+
+| Value | Meaning |
+|---|---|
+| `no_context` | Align-path row — no contig, so context was never attempted |
+| `flank_too_short` | Contig gave < 50 bp of flank on both sides |
+| `gene_not_in_reference` | The flanking DB holds nothing for this gene — only a larger reference helps |
+| `context_unmatched` | The DB holds the gene, but no reference flank matched this sample — possibly a host absent from the reference |
+| `alignment_failed` | The aligner errored on this locus |
+| `no_flanking_db` | Run without a flanking database |
 
 **Reading it:** `chromosome` + single Genus + single Species = trustworthy.
 `multi-genus(N)` and/or `plasmid` = a promiscuous / mobile gene — the genus is not a
-reliable single source.
+reliable single source. An `Unknown` genus is not a failure to report: check
+`Limited_By` to see whether more data would help.
 
 ## License & citation
 

@@ -332,7 +332,7 @@ pub fn build_from_sorted(
                 )?;
                 gene_count += 1;
 
-                if gene_count % 1000 == 0 {
+                if gene_count.is_multiple_of(1000) {
                     eprintln!(
                         "  Processed {} genes, {} records...",
                         gene_count, total_records

@@ -11,7 +11,7 @@ mod reassemble;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -68,9 +68,12 @@ ALIGNMENT TIE-BREAKING (for equal-score hits):
 
 OUTPUT FILES:
   results.tsv          Main output with detected ARGs and genus assignments
-    Columns: Sample, Contig_ID, ARG_Name, ARG_Class, Genus, Confidence, Specificity,
-             ARG_Identity, ARG_Coverage, Contig_Len, Upstream_Len,
-             Downstream_Len, Extension_Method, Top_Matches
+    Columns (29): Sample, Contig_ID, ARG_Name, ARG_Class, Genus, Species, Confidence,
+             Specificity, Context, ARG_Identity, ARG_Coverage, Contig_Len, ARG_Start,
+             ARG_End, Upstream_Len, Downstream_Len, Extension_Method, Top_Matches,
+             Credible_Set, Resolution_Rank, Resolution_Taxon, Support,
+             Resolution_Distance, Limited_By, Detection_Path, N_SNP, N_INDEL,
+             INDEL_bp, Variants
 
   {sample}/            Per-sample directory (kept with -u flag)
     contigs_strict.fasta   Extended contigs (k-mer overlap)
@@ -217,6 +220,23 @@ struct Args {
     #[arg(short = 'c', long = "arg-coverage", value_name = "FLOAT",
           default_value = "0.70", value_parser = parse_arg_coverage, help_heading = "ARG Detection")]
     arg_coverage: f64,
+
+    /// Also report ARGs that only the read->ARG alignment supports (assembly broke the gene).
+    /// These rows carry no flanking, so they are never attributed: Genus/Species/Context stay
+    /// Unknown and Limited_By is "no_context". Detection_Path distinguishes them.
+    #[arg(long = "align-path", value_name = "on|off", default_value = "on",
+          value_parser = ["on", "off"], help_heading = "ARG Detection")]
+    align_path: String,
+
+    /// Minimum reference breadth (read-covered fraction) for an align-path call
+    #[arg(long = "align-min-breadth", value_name = "FLOAT", default_value = "0.80",
+          help_heading = "ARG Detection")]
+    align_min_breadth: f64,
+
+    /// Minimum aligned reads for an align-path call
+    #[arg(long = "align-min-reads", value_name = "N", default_value = "10",
+          help_heading = "ARG Detection")]
+    align_min_reads: usize,
 
     // ===== GENUS CLASSIFICATION =====
     /// Minimum specificity for genus assignment [0-100%]
@@ -514,9 +534,28 @@ struct ResultRow {
     credible_set: String, // kernel credible set: "genusA(0.62);genusB(0.31)" to 0.9 mass
     support: f64,        // posterior mass of the credible set (UNCALIBRATED)
     resolution_distance: f64, // mash radius of the credible set (0 = single genus)
-    limited_by: String,  // query / biology / none
+    limited_by: String,  // answered rows: none / flank_truncated / flank_shared
+                         // Unknown rows:  no_context / flank_too_short /
+                         //   gene_not_in_reference / context_unmatched /
+                         //   alignment_failed / no_flanking_db
+    /// Which evidence produced this row: "assembly" (ARG found on an assembled contig, the
+    /// normal path) or "align" (ARG seen only in the read->ARG alignment because assembly
+    /// broke the gene). An align row carries no flanking, so it cannot be attributed --
+    /// it exists so the ARG is not silently missing. See `build_align_rows`.
+    detection_path: String,
     resolution_rank: String,  // LCA rank of the credible set (ragged: species..root)
     resolution_taxon: String, // LCA taxon name (e.g. Enterobacteriaceae)
+    /// Differences from the reference allele, read off the detection alignment.
+    /// `ARG_Identity` compresses these into one number and so hides their structure --
+    /// which is precisely what separates a point-mutation resistance allele (a few codon
+    /// changes on an otherwise identical sequence) from another organism's homologue of
+    /// the same gene (hundreds of scattered substitutions plus indels). -1 = not applicable
+    /// (align path / reassembly, where there is no contig-vs-reference traceback).
+    n_snp: i64,
+    n_indel: i64,
+    indel_bp: i64,
+    /// Substitutions as `<refpos><refbase>><altbase>`, reference coordinates, comma-separated.
+    variants: String,
 }
 
 /// Formats the reported genus from a classification result. When several genera are
@@ -582,10 +621,109 @@ struct ArgHit {
     contig_start: usize,
     contig_end: usize,
     strand: char,
+    /// Alignment length (summed over merged HSPs). Breaks identity/coverage ties when
+    /// choosing the representative among redundant refs at one locus -- see better().
+    aln_len: usize,
     /// All PanRes reference IDs that tie at this locus (same identity & coverage as the
     /// representative). These are redundant DB representations of the same physical gene;
     /// classification unions their flanking reference sets so no source's evidence is lost.
     members: Vec<String>,
+    /// Substitutions vs the reference allele, summed over the merged HSPs.
+    ///
+    /// A percent identity hides the STRUCTURE of the difference, and for point-mutation
+    /// resistance genes the structure is the whole answer: those alleles are defined by a
+    /// handful of codon changes against an otherwise identical reference, so "present" means
+    /// near-zero differences. 84% identity over 3.2 kb is not a resistant allele -- it is 477
+    /// scattered substitutions plus 9 indels, i.e. another organism's homologue of the same
+    /// housekeeping gene (observed: Bifidobacterium adolescentis ileS matching the CARD
+    /// B. bifidum ileS_MUP entry). Reporting the counts lets that be seen instead of inferred.
+    n_snp: usize,
+    /// Gap openings vs the reference allele (indel events, not bases).
+    n_indel: usize,
+    /// Total gapped bases vs the reference allele.
+    indel_bp: usize,
+    /// Substitutions as `<refpos><refbase>><altbase>` (reference coordinates, 1-based),
+    /// comma-separated. Capped at MAX_REPORTED_VARIANTS entries; an exact-match locus is
+    /// the empty string.
+    variants: String,
+}
+
+/// Cap on substitutions written to the `Variants` column. Beyond this the locus is plainly
+/// a divergent homologue, not an allele call, and the full list is noise in a TSV -- the
+/// counts in `N_SNP`/`N_INDEL` still carry the magnitude.
+const MAX_REPORTED_VARIANTS: usize = 20;
+
+/// Complement of one IUPAC base, preserving case; anything unrecognised passes through.
+fn complement_base(c: char) -> char {
+    match c {
+        'A' => 'T', 'T' => 'A', 'G' => 'C', 'C' => 'G',
+        'a' => 't', 't' => 'a', 'g' => 'c', 'c' => 'g',
+        'R' => 'Y', 'Y' => 'R', 'S' => 'S', 'W' => 'W', 'K' => 'M', 'M' => 'K',
+        'B' => 'V', 'V' => 'B', 'D' => 'H', 'H' => 'D', 'N' => 'N',
+        'r' => 'y', 'y' => 'r', 's' => 's', 'w' => 'w', 'k' => 'm', 'm' => 'k',
+        'b' => 'v', 'v' => 'b', 'd' => 'h', 'h' => 'd', 'n' => 'n',
+        other => other,
+    }
+}
+
+/// Parses one BLAST `btop` (traceback operations) string into substitutions and gaps,
+/// expressed in REFERENCE (subject) coordinates, on the reference's OWN strand.
+///
+/// btop alternates run-lengths of matches with 2-character operations, where the first
+/// character is the query base and the second the subject base; `-` on either side is a gap.
+/// `sstart`/`send` give the subject span and its direction (send < sstart => minus strand),
+/// so the subject cursor steps by +1 or -1 accordingly and the reported positions are always
+/// on the reference's own coordinate system.
+///
+/// On a minus-strand hit blastn prints the subject reverse-complemented, so the btop LETTERS
+/// are the complement of the reference's own bases while the coordinates stay on the plus
+/// strand. Both letters are therefore complemented back for a minus hit, otherwise `Variants`
+/// would mix plus-strand positions with minus-strand bases and could not be checked against a
+/// point-mutation catalogue. Verified against blastn 2.17: a plus-strand hit carrying ref
+/// position 50 A>G reports `49GA70`, and the reverse-complemented query of the same sample
+/// reports `70CT49` — both must yield `50A>G`.
+///
+/// Returns (substitutions as (refpos, refbase, altbase), gap openings, gapped bases).
+fn parse_btop(btop: &str, sstart: usize, send: usize) -> (Vec<(usize, char, char)>, usize, usize) {
+    let step: i64 = if send >= sstart { 1 } else { -1 };
+    let mut spos = sstart as i64;
+    let mut subs = Vec::new();
+    let (mut gap_open, mut gap_bp) = (0usize, 0usize);
+    let mut in_gap = false;
+    let mut it = btop.chars().peekable();
+    let mut run = String::new();
+    while let Some(c) = it.next() {
+        if c.is_ascii_digit() {
+            run.push(c);
+            if it.peek().is_none_or(|n| !n.is_ascii_digit()) {
+                spos += run.parse::<i64>().unwrap_or(0) * step;
+                run.clear();
+                in_gap = false;
+            }
+            continue;
+        }
+        // Two-character operation: query base then subject base.
+        let q = c;
+        let sb = match it.next() { Some(x) => x, None => break };
+        if q == '-' || sb == '-' {
+            if !in_gap { gap_open += 1; in_gap = true; }
+            gap_bp += 1;
+            // A gap in the QUERY still consumes a reference base; a gap in the SUBJECT does not.
+            if q == '-' { spos += step; }
+        } else {
+            in_gap = false;
+            if spos >= 1 {
+                let (refb, altb) = if step < 0 {
+                    (complement_base(sb), complement_base(q))
+                } else {
+                    (sb, q)
+                };
+                subs.push((spos as usize, refb, altb));
+            }
+            spos += step;
+        }
+    }
+    (subs, gap_open, gap_bp)
 }
 
 /// Validate ARG database file format
@@ -667,6 +805,7 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
 }
 
 /// Handle --build-db command
+#[allow(clippy::too_many_arguments)]
 fn handle_build_db(
     db_type: &str,
     source: &str,
@@ -892,7 +1031,7 @@ fn handle_build_db(
 
                     // For --mode long, require FASTA (not .mmi)
                     // The .mmi format is a lossy index that cannot recover sequences
-                    flanking_db_ntprok::validate_arg_db_format(&arg_db)?;
+                    flanking_db_ntprok::validate_arg_db_format(arg_db)?;
 
                     let ntprok_config = flanking_db_ntprok::NtProkConfig {
                         blastn_path: blastn.to_path_buf(),
@@ -918,7 +1057,7 @@ fn handle_build_db(
                     eprintln!("Threads: {}", threads);
                     eprintln!();
 
-                    flanking_db_ntprok::build(output_dir, &arg_db, ntprok_config)
+                    flanking_db_ntprok::build(output_dir, arg_db, ntprok_config)
                 }
                 other => {
                     anyhow::bail!(
@@ -1408,7 +1547,8 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
             &sample_dir, &args.bwa_mem2, args.paftools_path.as_deref(), args.threads)?,
         _ => run_minimap2_reads(&sample.r1, &sample.r2, args.arg_db.as_ref().unwrap(), &sample_dir, &args.minimap2, args.threads)?,
     };
-    let matching_reads = parse_paf_filter(&paf_path, args.identity, args.min_align_len)?;
+    let (matching_reads, mut read_evidence) =
+        parse_paf_filter_with_evidence(&paf_path, args.identity, args.min_align_len)?;
 
     if args.verbose {
         eprintln!("        Reads passing filter: {}", matching_reads.len());
@@ -1554,9 +1694,9 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         for hit in &unique_args {
             let gr = genus_results.iter()
                 .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig);
-            let short_flank = gr.map_or(true, |g| g.upstream_len < min_flanking_for_resolve
+            let short_flank = gr.is_none_or(|g| g.upstream_len < min_flanking_for_resolve
                 && g.downstream_len < min_flanking_for_resolve);
-            let is_plasmid = gr.map_or(false, |g| g.context == "plasmid");
+            let is_plasmid = gr.is_some_and(|g| g.context == "plasmid");
             if !short_flank || is_plasmid {
                 continue;
             }
@@ -1613,6 +1753,12 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                                 contig_start: sc.arg_start,
                                 contig_end: sc.arg_end,
                                 strand: '+',
+                                // Reassembled loci carry no HSP detail; the stitched ARG span
+                                // is the best available proxy for alignment length.
+                                aln_len: sc.arg_end.saturating_sub(sc.arg_start),
+                                // Reassembly stitches the ARG back on from the reference, so
+                                // there is no alignment traceback to read variants from.
+                                n_snp: 0, n_indel: 0, indel_bp: 0, variants: String::new(),
                             });
                         }
                     }
@@ -1655,7 +1801,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
     }
 
     // Build result rows with extension_method
-    let results: Vec<ResultRow> = unique_args.iter()
+    let mut results: Vec<ResultRow> = unique_args.iter()
         .map(|hit| {
             let key = format!("{}:{}", hit.arg_name, hit.contig);
 
@@ -1722,8 +1868,13 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                 support: genus_info.support,
                 resolution_distance: genus_info.resolution_distance,
                 limited_by: genus_info.limited_by.clone(),
+                detection_path: "assembly".to_string(),
                 resolution_rank: genus_info.resolution_rank.clone(),
                 resolution_taxon: genus_info.resolution_taxon.clone(),
+                n_snp: hit.n_snp as i64,
+                n_indel: hit.n_indel as i64,
+                indel_bp: hit.indel_bp as i64,
+                variants: hit.variants.clone(),
             }
         })
         .collect();
@@ -1742,6 +1893,23 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
             }
         }
         if args.verbose { eprintln!("        Per-locus outputs written ({} classes)", emit_sel.classes.len()); }
+    }
+
+    // ---- align path: ARGs the assembly lost ----
+    // Deduplicate against what assembly already reported. Compare by ARG NAME (the part
+    // before '|'), not the full reference id: PanRes holds many near-identical alleles of one
+    // gene, so id-level comparison would re-report the same gene under a sibling allele.
+    if args.align_path == "on" {
+        let assembled: FxHashSet<String> = unique_args.iter()
+            .flat_map(|h| h.members.iter().cloned().chain(std::iter::once(h.arg_name.clone())))
+            .collect();
+        let clusters = load_arg_clusters(args.arg_db.as_deref());
+        let extra = build_align_rows(&sample.name, &mut read_evidence, &assembled, &clusters,
+                                     args.align_min_breadth, args.align_min_reads);
+        if args.verbose && !extra.is_empty() {
+            eprintln!("        [align path] {} ARGs recovered that assembly missed", extra.len());
+        }
+        results.extend(extra);
     }
 
     Ok(results)
@@ -1822,7 +1990,7 @@ fn classify_genera(
                     credible_set: vec![],
                     support: 0.0,
                     resolution_distance: 0.0,
-                    limited_by: "none".to_string(),
+                    limited_by: "no_flanking_db".to_string(),
                     resolution_rank: "NA".to_string(),
                     resolution_taxon: "NA".to_string(),
                     credible_set_grouped: String::new(),
@@ -1854,7 +2022,7 @@ fn classify_genera(
 }
 
 fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
-    let header = "Sample\tContig_ID\tARG_Name\tARG_Class\tGenus\tSpecies\tConfidence\tSpecificity\tContext\tARG_Identity\tARG_Coverage\tContig_Len\tARG_Start\tARG_End\tUpstream_Len\tDownstream_Len\tExtension_Method\tTop_Matches\tCredible_Set\tResolution_Rank\tResolution_Taxon\tSupport\tResolution_Distance\tLimited_By";
+    let header = "Sample\tContig_ID\tARG_Name\tARG_Class\tGenus\tSpecies\tConfidence\tSpecificity\tContext\tARG_Identity\tARG_Coverage\tContig_Len\tARG_Start\tARG_End\tUpstream_Len\tDownstream_Len\tExtension_Method\tTop_Matches\tCredible_Set\tResolution_Rank\tResolution_Taxon\tSupport\tResolution_Distance\tLimited_By\tDetection_Path\tN_SNP\tN_INDEL\tINDEL_bp\tVariants";
 
     // By default, filter out WildType and NotCovered (not true resistance genes)
     // WildType: SNP position checked but found wild-type allele (no resistance mutation)
@@ -1879,7 +2047,7 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
     for r in &output_results {
         writeln!(
             output,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
             r.sample,
             r.contig_id,
             r.arg_name,
@@ -1903,7 +2071,12 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
             r.resolution_taxon,
             r.support,
             r.resolution_distance,
-            r.limited_by
+            r.limited_by,
+            r.detection_path,
+            if r.n_snp < 0 { "NA".to_string() } else { r.n_snp.to_string() },
+            if r.n_indel < 0 { "NA".to_string() } else { r.n_indel.to_string() },
+            if r.indel_bp < 0 { "NA".to_string() } else { r.indel_bp.to_string() },
+            if r.variants.is_empty() { "-" } else { &r.variants },
         )?;
     }
 
@@ -1929,6 +2102,7 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
 /// reads to the contigs and drops interior reads once local coverage exceeds `cap`,
 /// while keeping every terminal-zone and unmapped read (extension/flanking fuel).
 /// Deterministic: alignments are processed in a fixed sort order.
+#[allow(clippy::too_many_arguments)]
 fn cap_interior_reads(
     contigs: &[FastaRecord],
     r1: &Path,
@@ -1965,7 +2139,7 @@ fn cap_interior_reads(
         for rec in reader {
             let r = rec?;
             let e = best.get(&r.query_name);
-            if e.map_or(true, |(m, ..)| r.matches > *m) {
+            if e.is_none_or(|(m, ..)| r.matches > *m) {
                 best.insert(
                     r.query_name.clone(),
                     (r.matches, r.target_name, r.target_len, r.target_start, r.target_end),
@@ -2309,7 +2483,7 @@ fn ensure_bwamem2_index(bwa_mem2: &str, fasta: &Path) -> Result<()> {
 
 /// Read filter using strobealign (paired). Emits SAM, converts to PAF, returns PAF path.
 /// The PAF is semantically identical to minimap2's (matches/block_len), so the
-/// existing parse_paf_filter contract holds unchanged.
+/// existing parse_paf_filter_with_evidence contract holds unchanged.
 fn run_strobealign_reads(
     r1: &Path, r2: &Path, ref_fasta: &Path, output_dir: &Path,
     strobealign: &str, paftools: Option<&Path>, threads: usize,
@@ -2386,7 +2560,7 @@ fn convert_sam_to_paf(sam: &Path, paf: &Path, paftools: Option<&Path>) -> Result
 ///   block_len (col 11) = sum of CIGAR M/I/D/=/X   (aligned columns + indels)
 ///   matches   (col 10) = aligned columns (M/=/X) - mismatches,
 ///                        where mismatches = NM - (inserted + deleted bases)
-/// so parse_paf_filter's identity = matches/block_len matches minimap2 exactly.
+/// so parse_paf_filter_with_evidence's identity = matches/block_len matches minimap2 exactly.
 /// Records without an alignment (FLAG 0x4) or without an NM tag are skipped.
 fn sam_to_paf_builtin(sam: &Path, paf: &Path) -> Result<()> {
     let reader = BufReader::with_capacity(1 << 20, File::open(sam)?);
@@ -2500,8 +2674,54 @@ fn sam_to_paf_builtin(sam: &Path, paf: &Path) -> Result<()> {
     Ok(())
 }
 
-fn parse_paf_filter(paf_path: &Path, min_identity: f64, min_align_len: usize) -> Result<FxHashSet<String>> {
+/// Per-reference read-level evidence, collected in the same pass that selects reads for
+/// assembly. The read->ARG alignment is computed anyway to decide which reads to hand to
+/// MEGAHIT; keeping the target side of it costs nothing and is the only way to see an ARG
+/// whose assembly broke (a contig edge can cut a gene below the -c coverage floor, so it
+/// never reaches ARG detection at all -- observed for aph(3'')-Ib on the Abramova spike-in).
+#[derive(Default)]
+struct ReadEvidence {
+    /// reference length
+    ref_len: usize,
+    /// number of reads aligned to this reference
+    reads: usize,
+    /// reads aligned with zero mismatches -- used to pick the allele within a cluster
+    perfect: usize,
+    /// covered intervals on the reference, merged lazily in `breadth()`
+    intervals: Vec<(usize, usize)>,
+}
+
+impl ReadEvidence {
+    /// Fraction of the reference covered by at least one read.
+    fn breadth(&mut self) -> f64 {
+        if self.ref_len == 0 || self.intervals.is_empty() {
+            return 0.0;
+        }
+        self.intervals.sort_unstable();
+        let (mut covered, mut cur_s, mut cur_e) = (0usize, self.intervals[0].0, self.intervals[0].1);
+        for &(s, e) in &self.intervals[1..] {
+            if s <= cur_e {
+                cur_e = cur_e.max(e);
+            } else {
+                covered += cur_e - cur_s;
+                cur_s = s;
+                cur_e = e;
+            }
+        }
+        covered += cur_e - cur_s;
+        covered as f64 / self.ref_len as f64
+    }
+}
+
+/// Single pass over the read->ARG PAF: the set of reads clearing the identity/length floor
+/// (the assembly input) plus the per-reference read evidence the align path scores.
+fn parse_paf_filter_with_evidence(
+    paf_path: &Path,
+    min_identity: f64,
+    min_align_len: usize,
+) -> Result<(FxHashSet<String>, FxHashMap<String, ReadEvidence>)> {
     let mut matching = FxHashSet::default();
+    let mut evidence: FxHashMap<String, ReadEvidence> = FxHashMap::default();
     let min_identity_pct = min_identity * 100.0;
 
     let reader = PafReader::open(paf_path)?;
@@ -2509,11 +2729,169 @@ fn parse_paf_filter(paf_path: &Path, min_identity: f64, min_align_len: usize) ->
         let rec = record?;
         let identity = rec.calculate_identity();
         if identity >= min_identity_pct && rec.block_len >= min_align_len {
+            let e = evidence.entry(rec.target_name.clone()).or_default();
+            e.ref_len = rec.target_len;
+            e.reads += 1;
+            if rec.matches == rec.block_len { e.perfect += 1; }
+            e.intervals.push((rec.target_start, rec.target_end));
             matching.insert(rec.query_name);
         }
     }
 
-    Ok(matching)
+    Ok((matching, evidence))
+}
+
+/// Load an optional `arg_clusters.tsv` (member<TAB>representative) sitting beside the ARG
+/// database. Without it the align path cannot deduplicate: PanRes holds many near-identical
+/// alleles of one gene (a single TEM cluster spans 306 entries, OXA 62, CTX 40), so a gene
+/// present in the sample matches every sibling allele and would be reported once per allele.
+/// Folding to the cluster representative reports it once. Missing file => identity mapping.
+fn load_arg_clusters(db_path: Option<&Path>) -> FxHashMap<String, String> {
+    let mut map = FxHashMap::default();
+    let Some(db) = db_path else { return map };
+    let dir = if db.is_dir() { db.to_path_buf() } else { match db.parent() {
+        Some(d) => d.to_path_buf(), None => return map } };
+    let f = dir.join("arg_clusters.tsv");
+    if let Ok(txt) = std::fs::read_to_string(&f) {
+        for line in txt.lines() {
+            let mut it = line.split('\t');
+            if let (Some(m), Some(r)) = (it.next(), it.next()) {
+                map.insert(m.to_string(), r.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Build rows for ARGs that only the read->ARG alignment supports.
+///
+/// The assembly path can lose a gene entirely: if a contig edge cuts it, reference coverage
+/// falls below `-c` and it never reaches ARG detection, so it is silently absent from the
+/// report (observed for aph(3'')-Ib on the Abramova spike-in: 0.32-0.54 coverage vs a 0.70
+/// floor). The read alignment that selected reads for assembly already knows the gene is
+/// there; this surfaces it instead of discarding that evidence.
+///
+/// Rules:
+///  - assembly wins: anything the assembly path already reported is skipped.
+///  - dedup is by **gene**, not reference id. PanRes carries many near-identical alleles of
+///    one gene (327 TEM, 49 NDM entries), so comparing raw ids would re-report the same gene
+///    under a sibling allele. `same_gene` groups by the ARG name prefix the caller supplies.
+///  - no attribution: a read-level hit has no flanking, so genus/species/context stay Unknown
+///    and `limited_by` is "no_context". These rows say "the gene is present but its context
+///    could not be reconstructed" -- they must never be scored as attributions.
+fn build_align_rows(
+    sample: &str,
+    evidence: &mut FxHashMap<String, ReadEvidence>,
+    assembled: &FxHashSet<String>,
+    clusters: &FxHashMap<String, String>,
+    min_breadth: f64,
+    min_reads: usize,
+) -> Vec<ResultRow> {
+    let clu = |n: &str| clusters.get(n).cloned().unwrap_or_else(|| n.to_string());
+    // Cluster representatives the assembly path already covered.
+    let asm_clusters: FxHashSet<String> = assembled.iter().map(|n| clu(n)).collect();
+
+    // Group candidates by cluster. One real gene matches every near-identical sibling allele
+    // (a TEM cluster spans 306 PanRes entries), so emitting per entry would report one gene
+    // 306 times. Emit once per cluster -- but pick WHICH allele from the read evidence rather
+    // than defaulting to the cluster representative: measured on the Abramova spike-in, 60 of
+    // 65 align-path clusters have a member whose perfect-match read count leads the runner-up
+    // by >=20%, so defaulting to the representative would throw that resolution away.
+    let mut by_cluster: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    for name in evidence.keys() {
+        let rep = clu(name);
+        if asm_clusters.contains(&rep) { continue; }
+        by_cluster.entry(rep).or_default().push(name.clone());
+    }
+
+    let mut rows = Vec::new();
+    let mut reps: Vec<String> = by_cluster.keys().cloned().collect();
+    reps.sort();                        // deterministic output order
+    for rep in reps {
+        let mut cands = by_cluster.remove(&rep).unwrap();
+        cands.sort();                   // stable tie-break
+        // Keep only members that clear the thresholds on their own.
+        let mut scored: Vec<(String, usize, usize, usize, f64)> = Vec::new();
+        for c in &cands {
+            let (reads, perfect, ref_len, breadth) = {
+                let e = evidence.get_mut(c).unwrap();
+                (e.reads, e.perfect, e.ref_len, e.breadth())
+            };
+            if reads >= min_reads && breadth >= min_breadth {
+                scored.push((c.clone(), reads, perfect, ref_len, breadth));
+            }
+        }
+        if scored.is_empty() { continue; }
+        // Best allele = most perfect-match reads; ties fall back to more reads, then name.
+        scored.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+        let best = scored[0].clone();
+        let runner = scored.get(1).map(|x| x.2).unwrap_or(0);
+        // `margin` = how far the winning allele leads the runner-up on perfect-match reads:
+        //     (best.perfect - runner.perfect) / best.perfect
+        //
+        // It measures ONLY the separation BETWEEN sibling alleles -- it is NOT a confidence
+        // that the gene is present, and NOT a confidence that the winning allele is right in
+        // absolute terms. Two consequences worth knowing before trusting it:
+        //   * a single surviving candidate gets margin 1.00 by definition (nothing to compare
+        //     against), even if its own support is weak;
+        //   * margin is undefined when the winner has zero perfect-match reads, and is
+        //     reported as 1.00 in that case if it is also the only candidate. `support`
+        //     (perfect/total reads) is what tells you the call is thin -- e.g. a row reading
+        //     `alleles:1;support:0/22;margin:1.00` means the gene is covered by reads but NO
+        //     read matches this reference exactly, so the allele label is a nearest neighbour,
+        //     not an identification.
+        // Always read `margin` together with `alleles` and `support`; margin alone is
+        // meaningless for a single-candidate cluster.
+        let margin = if best.2 == 0 {
+            if scored.len() == 1 { 1.0 } else { 0.0 }
+        } else {
+            (best.2 - runner) as f64 / best.2 as f64
+        };
+        let (name, reads, perfect, ref_len, breadth) =
+            (best.0, best.1, best.2, best.3, best.4);
+        let n_alleles = scored.len();
+        let parts: Vec<&str> = name.split('|').collect();
+        rows.push(ResultRow {
+            sample: sample.to_string(),
+            contig_id: "NA".to_string(),
+            arg_name: parts.first().unwrap_or(&"").to_string(),
+            arg_class: parts.get(1).unwrap_or(&"UNKNOWN").to_string(),
+            genus: "Unknown".to_string(),
+            confidence: 0.0,
+            specificity: 0.0,
+            identity: 0.0,
+            // Reference breadth from read alignment, not a contig-vs-reference coverage.
+            coverage: breadth * 100.0,
+            contig_len: ref_len,
+            arg_start: 0,
+            arg_end: ref_len,
+            upstream_len: 0,
+            downstream_len: 0,
+            extension_method: "none".to_string(),
+            // Carry the allele evidence so a reader can judge it:
+            //   read_only : reference breadth covered by reads
+            //   alleles   : sibling alleles in this cluster that cleared the thresholds
+            //   support   : winner's perfect-match reads / total reads on it
+            //   margin    : lead over the runner-up ON PERFECT READS ONLY (see above) --
+            //               1.00 for a single candidate, so judge it with `support`.
+            top_matches: format!("read_only:{:.3};alleles:{};support:{}/{};margin:{:.2}",
+                                 breadth, n_alleles, perfect, reads, margin),
+            snp_status: "NA".to_string(),
+            context: "NA".to_string(),
+            species: "Unknown".to_string(),
+            credible_set: String::new(),
+            support: 0.0,
+            resolution_distance: 0.0,
+            limited_by: "no_context".to_string(),
+            detection_path: "align".to_string(),
+            resolution_rank: "NA".to_string(),
+            resolution_taxon: "NA".to_string(),
+            // The align path has no contig-vs-reference alignment to read a traceback from;
+            // its per-read evidence is carried in Top_Matches (support = perfect/total reads).
+            n_snp: -1, n_indel: -1, indel_bp: -1, variants: String::new(),
+        });
+    }
+    rows
 }
 
 fn extract_read_pairs(r1: &Path, r2: &Path, matching: &FxHashSet<String>, output_dir: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -2728,7 +3106,7 @@ fn emit_locus_asm(
             Some(r) => r, None => continue,
         };
         let class = locus_class(res).to_string();
-        if !sel.classes.iter().any(|c| *c == class) { continue; }
+        if !sel.classes.contains(&class) { continue; }
 
         let contig_key = hit.contig.split_whitespace().next().unwrap_or(&hit.contig);
         if !seen.insert((contig_key.to_string(), hit.contig_start, hit.contig_end)) { continue; }
@@ -2819,7 +3197,7 @@ fn emit_locus_reads(
             Some(r) => r, None => continue,
         };
         let class = locus_class(res).to_string();
-        if !sel.classes.iter().any(|c| *c == class) { continue; }
+        if !sel.classes.contains(&class) { continue; }
         let ckey = hit.contig.split_whitespace().next().unwrap_or(&hit.contig).to_string();
         if !seen.insert((ckey.clone(), hit.contig_start, hit.contig_end)) { continue; }
         let cl = *clen.get(ckey.as_str()).unwrap_or(&0);
@@ -2956,8 +3334,13 @@ fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
             support: g.support,
             resolution_distance: g.resolution_distance,
             limited_by: g.limited_by.clone(),
+            detection_path: "assembly".to_string(),
             resolution_rank: g.resolution_rank.clone(),
             resolution_taxon: g.resolution_taxon.clone(),
+            n_snp: hit.n_snp as i64,
+            n_indel: hit.n_indel as i64,
+            indel_bp: hit.indel_bp as i64,
+            variants: hit.variants.clone(),
         }
     }).collect();
 
@@ -2993,6 +3376,7 @@ fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
 /// the coverage/identity filter, so a gene split into several HSPs is not lost. Redundant
 /// hits (PanRes maps one gene to many near-identical refs) are collapsed later by
 /// deduplicate_args().
+#[allow(clippy::too_many_arguments)]
 fn detect_args_blast(
     contigs: &Path,
     arg_db_fasta: &Path,
@@ -3030,7 +3414,7 @@ fn detect_args_blast(
         .args(["-task", "dc-megablast",
                "-query", contigs.to_str().unwrap(),
                "-db", db_prefix.to_str().unwrap(),
-               "-outfmt", "6 qseqid qlen sseqid slen pident length qstart qend sstart send",
+               "-outfmt", "6 qseqid qlen sseqid slen pident length qstart qend sstart send btop",
                "-perc_identity", &perc,
                "-max_target_seqs", "100000",
                "-evalue", "1e-10",
@@ -3045,7 +3429,8 @@ fn detect_args_blast(
 
     // Group HSPs by (contig, reference), then merge those close on the contig into one
     // physical locus before applying the coverage/identity filter.
-    struct Hsp { qs: usize, qe: usize, ss: usize, se: usize, fwd: bool, matches: f64, alen: usize }
+    struct Hsp { qs: usize, qe: usize, ss: usize, se: usize, fwd: bool, matches: f64, alen: usize,
+                 subs: Vec<(usize, char, char)>, gap_open: usize, gap_bp: usize }
     let mut groups: HashMap<(String, String), (usize, usize, Vec<Hsp>)> = HashMap::new();
     let content = std::fs::read_to_string(&out)
         .with_context(|| format!("Failed to read {}", out.display()))?;
@@ -3061,6 +3446,12 @@ fn detect_args_blast(
         let sstart: usize = f[8].parse().unwrap_or(0);
         let send: usize = f[9].parse().unwrap_or(0);
         if slen == 0 || length == 0 { continue; }
+        // btop describes every difference in this HSP. Percent identity alone cannot
+        // distinguish "the resistant allele" (a few codon changes) from "another
+        // organism's homologue" (hundreds of scattered substitutions plus indels).
+        let (subs, gap_open, gap_bp) = f.get(10)
+            .map(|b| parse_btop(b, sstart, send))
+            .unwrap_or_else(|| (Vec::new(), 0, 0));
         let entry = groups.entry((f[0].to_string(), f[2].to_string()))
             .or_insert((qlen, slen, Vec::new()));
         entry.2.push(Hsp {
@@ -3069,6 +3460,7 @@ fn detect_args_blast(
             fwd: sstart <= send,
             matches: pident / 100.0 * length as f64,
             alen: length,
+            subs, gap_open, gap_bp,
         });
     }
 
@@ -3104,6 +3496,16 @@ fn detect_args_blast(
                 let fwd = cluster.iter().filter(|h| h.fwd).count() * 2 >= cluster.len();
                 let parts: Vec<&str> = refname.split('|').collect();
                 let arg_name = parts.first().unwrap_or(&"").to_string();
+                // Merged HSPs can overlap on the reference, so collapse by position before
+                // counting -- otherwise one substitution in an overlap is counted twice.
+                let mut sub_map: std::collections::BTreeMap<usize, (char, char)> =
+                    std::collections::BTreeMap::new();
+                for h in cluster { for &(p, r, a) in &h.subs { sub_map.insert(p, (r, a)); } }
+                let n_indel: usize = cluster.iter().map(|h| h.gap_open).sum();
+                let indel_bp: usize = cluster.iter().map(|h| h.gap_bp).sum();
+                let variants = sub_map.iter().take(MAX_REPORTED_VARIANTS)
+                    .map(|(p, (r, a))| format!("{}{}>{}", p, r, a))
+                    .collect::<Vec<_>>().join(",");
                 hits.push(ArgHit {
                     members: vec![arg_name.clone()],
                     arg_name,
@@ -3115,6 +3517,11 @@ fn detect_args_blast(
                     contig_start: gstart.saturating_sub(1), // BLAST 1-based → 0-based half-open (matches old minimap2 coords)
                     contig_end: gend,
                     strand: if fwd { '+' } else { '-' },
+                    aln_len: sum_alen,
+                    n_snp: sub_map.len(),
+                    n_indel,
+                    indel_bp,
+                    variants,
                 });
             }
             i = j;
@@ -3144,11 +3551,29 @@ fn detect_args_blast(
 /// Distinct genes on one contig (e.g. an integron cassette: sul1 + aadA2 + dfrA12) sit
 /// at different, non-overlapping spans and therefore remain SEPARATE loci.
 fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
-    // Representative preference within a locus: higher identity, then higher coverage,
-    // then the SHORTER span. Shorter wins the final tie so a tight, gene-length allele
-    // is chosen over a padded consensus reference (e.g. a MEGARes entry longer than the
-    // gene), keeping the reported ARG_Start/End close to the true gene boundary. A real
-    // partial fragment is already beaten earlier on coverage, so "shorter" here is safe.
+    // Representative preference within a locus: higher identity, then higher coverage, then
+    // the LONGER alignment, then the shorter span.
+    //
+    // The alignment-length step is what keeps allele resolution. Identity and coverage tie
+    // constantly among the redundant PanRes representations of one gene, and the old final
+    // tiebreak ("shorter span wins") then threw away the longer, more-evidenced alignment.
+    // Observed on a real spike-in: blaNDM-1 (pan_3, 813 bp) and a 724 bp family-level "NDM"
+    // entry (pan_13066) both aligned at 100% identity / 100% coverage, and the shorter entry
+    // won -- so the report said "NDM" instead of "NDM-1". Coverage cannot separate them
+    // because it is normalised by the REFERENCE length, so any reference that aligns
+    // end-to-end scores 1.0 regardless of how much sequence it actually explains.
+    //
+    // Keeping identity and coverage as the first two keys (rather than replacing them with a
+    // mismatch/bitscore composite) matters: a composite mixes a 1 bp allele difference with a
+    // tens-of-bp length difference and loses the allele, and measured worse here overall
+    // (genus attribution 0.914 -> 0.897 on D6331).
+    //
+    // Shorter span stays the last tiebreak so a tight, gene-length allele still beats a padded
+    // consensus of equal alignment length, keeping ARG_Start/End near the true gene boundary.
+    // Do NOT add a minimum-length floor: 85 legitimately named ARGs (vanC2/3, vanE, vanG2,
+    // CMY-10 ...) are nested inside longer operon-level references (VanC2XY, VanEXY ...) at
+    // 0.65-0.72 length ratio; the coverage filter already rejects an operon reference that
+    // only aligns over its embedded gene.
     fn better(a: &ArgHit, b: &ArgHit) -> bool {
         use std::cmp::Ordering::{Greater, Less};
         match a.identity.partial_cmp(&b.identity) {
@@ -3159,6 +3584,11 @@ fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
         match a.coverage.partial_cmp(&b.coverage) {
             Some(Greater) => return true,
             Some(Less) => return false,
+            _ => {}
+        }
+        match a.aln_len.cmp(&b.aln_len) {
+            Greater => return true,
+            Less => return false,
             _ => {}
         }
         let sa = a.contig_end.saturating_sub(a.contig_start);
@@ -3176,10 +3606,14 @@ fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
         for i in 1..group.len() {
             if better(&group[i], &group[best]) { best = i; }
         }
-        let (rid, rcov) = (group[best].identity, group[best].coverage);
+        // Tie on the same key used to rank (score), so the members set matches what
+        // better() considers equivalent. Identity/coverage equality is no longer the
+        // ranking key and would keep a different, inconsistent set.
+        let (rid, rcov, ralen) = (group[best].identity, group[best].coverage, group[best].aln_len);
         let mut members: Vec<String> = Vec::new();
         for h in &group {
-            if (h.identity - rid).abs() < 1e-9 && (h.coverage - rcov).abs() < 1e-9 {
+            if (h.identity - rid).abs() < 1e-9 && (h.coverage - rcov).abs() < 1e-9
+                && h.aln_len == ralen {
                 for m in &h.members {
                     if !members.contains(m) { members.push(m.clone()); }
                 }
@@ -3220,7 +3654,7 @@ fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
             if !group.is_empty() { result.push(finalize(std::mem::take(&mut group))); }
             rep = None;
         }
-        if rep.as_ref().map_or(true, |r| better(&hit, r)) {
+        if rep.as_ref().is_none_or(|r| better(&hit, r)) {
             rep = Some(hit.clone());
         }
         group.push(hit);
@@ -3236,7 +3670,6 @@ fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
 #[cfg(test)]
 mod sam2paf_tests {
     use super::*;
-    use std::io::Write as _;
 
     /// Parse a PAF file into (query, matches, block_len) tuples.
     fn read_paf(path: &Path) -> Vec<(String, usize, usize)> {
@@ -3282,5 +3715,71 @@ mod sam2paf_tests {
 
         let a = get("readA").unwrap();
         assert!(((a.1 as f64 / a.2 as f64) * 100.0 - 98.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod btop_tests {
+    use super::*;
+
+    /// Format substitutions the way the `Variants` column does, so the test asserts on
+    /// what a user actually reads.
+    fn render(subs: &[(usize, char, char)]) -> String {
+        subs.iter().map(|(p, r, a)| format!("{}{}>{}", p, r, a)).collect::<Vec<_>>().join(",")
+    }
+
+    /// The vectors below are real blastn 2.17 output, not hand-written: a 120 bp reference
+    /// was mutated at plus-strand position 50 (A>G) and queried both as-is and reverse-
+    /// complemented. Both orientations describe the SAME event and must parse identically.
+    #[test]
+    fn substitution_is_strand_normalised() {
+        // query_plus vs gene1: qstart..qend 1..120, sstart..send 1..120
+        let (subs, go, gbp) = parse_btop("49GA70", 1, 120);
+        assert_eq!(render(&subs), "50A>G");
+        assert_eq!((go, gbp), (0, 0));
+
+        // The reverse-complemented query of the same sample: sstart..send 120..1.
+        // Raw btop letters are C/T (the minus strand); the reference's own bases are A/G.
+        let (subs, go, gbp) = parse_btop("70CT49", 120, 1);
+        assert_eq!(render(&subs), "50A>G", "minus-strand hit must report reference-strand bases");
+        assert_eq!((go, gbp), (0, 0));
+    }
+
+    /// Same construction with plus-strand reference positions 60-62 deleted from the sample.
+    /// Gaps consume reference bases in both directions; the counts must not depend on strand.
+    #[test]
+    fn deletion_counts_match_on_both_strands() {
+        let (subs, go, gbp) = parse_btop("59-G-C-T58", 1, 120);
+        assert!(subs.is_empty(), "a clean deletion carries no substitutions");
+        assert_eq!((go, gbp), (1, 3), "one gap opening, three gapped bases");
+
+        let (subs, go, gbp) = parse_btop("58-A-G-C59", 120, 1);
+        assert!(subs.is_empty());
+        assert_eq!((go, gbp), (1, 3));
+    }
+
+    /// A gap in the SUBJECT (insertion in the sample) must not advance the reference cursor,
+    /// or every variant after it would be reported at the wrong position.
+    #[test]
+    fn subject_gap_does_not_consume_reference() {
+        // 10 matches, 2 inserted query bases, 10 matches, then a substitution.
+        let (subs, go, gbp) = parse_btop("10A-T-10GA9", 1, 30);
+        assert_eq!(render(&subs), "21A>G", "insertion must not shift downstream positions");
+        assert_eq!((go, gbp), (1, 2));
+    }
+
+    /// Separate gap runs are separate openings; a run is one opening however long it is.
+    #[test]
+    fn gap_openings_count_runs_not_bases() {
+        // 5 matches, 3-base deletion, 5 matches, 1-base deletion, 5 matches = 19 ref bases.
+        let (_, go, gbp) = parse_btop("5-A-A-A5-A5", 1, 19);
+        assert_eq!((go, gbp), (2, 4));
+    }
+
+    #[test]
+    fn exact_match_is_empty() {
+        let (subs, go, gbp) = parse_btop("120", 1, 120);
+        assert!(subs.is_empty());
+        assert_eq!((go, gbp), (0, 0));
     }
 }

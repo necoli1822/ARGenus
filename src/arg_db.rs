@@ -321,15 +321,13 @@ fn parse_reference_catalogue(catalogue_path: &Path) -> Result<FxHashMap<String, 
         if !refseq_prot.is_empty() || !genbank_prot.is_empty() {
             let key = if !allele.is_empty() { allele.clone() } else { gene_family.clone() };
             let prot_acc = if !refseq_prot.is_empty() { refseq_prot } else { genbank_prot };
-            if !entries.contains_key(&key) {
-                entries.insert(key, create_entry(prot_acc));
-            }
+            entries.entry(key).or_insert_with(|| create_entry(prot_acc));
         }
         // Handle nucleotide-only entries (e.g., 16S rRNA mutations) - key by allele
         else if nuc_acc.is_some() && genbank_start.is_some() && genbank_stop.is_some() && !allele.is_empty() {
             let key = format!("NUC:{}", allele);
-            if !entries.contains_key(&key) {
-                entries.insert(key, CatalogueEntry {
+            if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(key) {
+                slot.insert(CatalogueEntry {
                     protein_accession: String::new(),
                     allele: allele.clone(),
                     gene_family: gene_family.clone(),
@@ -602,12 +600,13 @@ fn fetch_wp_via_ipg(wp_accs: &[String], sequences: &mut FxHashMap<String, String
                 }
 
                 if let (Some(s), Some(e), Some(c)) = (start, stop, strand_char) {
-                    // Prefer RefSeq (NC_, NZ_)
-                    if source == "RefSeq" && (nuc_acc.starts_with("NC_") || nuc_acc.starts_with("NZ_")) {
-                        coord_map.insert(prot_acc.to_string(), (nuc_acc.to_string(), s, e, c));
-                    }
-                    // Use INSDC as fallback if no RefSeq yet
-                    else if source == "INSDC" {
+                    // Prefer RefSeq (NC_, NZ_), fall back to INSDC. The first accepted row
+                    // wins (the contains_key guard above skips any later one), so both cases
+                    // do the same thing once a row qualifies.
+                    let usable = (source == "RefSeq"
+                        && (nuc_acc.starts_with("NC_") || nuc_acc.starts_with("NZ_")))
+                        || source == "INSDC";
+                    if usable {
                         coord_map.insert(prot_acc.to_string(), (nuc_acc.to_string(), s, e, c));
                     }
                 }

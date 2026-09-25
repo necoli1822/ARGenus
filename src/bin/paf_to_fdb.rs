@@ -47,11 +47,9 @@ impl PafHit {
 
         // Query: contig_id|genome_file.fna
         let query = fields[0];
-        let (contig_id, genome_file) = if let Some(pipe_pos) = query.rfind('|') {
-            (query[..pipe_pos].to_string(), query[pipe_pos + 1..].to_string())
-        } else {
-            return None;
-        };
+        let pipe_pos = query.rfind('|')?;
+        let (contig_id, genome_file) =
+            (query[..pipe_pos].to_string(), query[pipe_pos + 1..].to_string());
 
         let query_start: usize = fields[2].parse().ok()?;
         let query_end: usize = fields[3].parse().ok()?;

@@ -428,16 +428,6 @@ fn reverse_complement(seq: &str) -> String {
 // Consensus Building
 // ============================================================================
 
-/// Builds consensus sequence from multiple extension candidates.
-///
-/// Uses positional voting with branching detection.
-/// Positions with minor allele frequency >= threshold are marked as N.
-///
-/// # Arguments
-/// * `sequences` - Extension candidates from overlapping reads
-/// * `min_coverage` - Minimum bases required at each position
-/// * `branching_threshold` - Minor allele frequency threshold for N
-/// * `max_len` - Maximum consensus length
 /// Scan one read against the contig-edge k-mer index and accumulate its overhangs
 /// (as per-position base counts) into the shared left/right count matrices. Shared
 /// by both the full-scan and indexed dispatch paths so they produce identical output.
@@ -592,8 +582,18 @@ fn build_consensus_from_counts(
     result
 }
 
+/// Builds a consensus sequence from multiple extension candidates by positional voting
+/// with branching detection: positions whose minor allele frequency reaches the threshold
+/// are written as N.
+///
 /// Reference (string-based) consensus, retained as the correctness oracle for
 /// `build_consensus_from_counts` (see test_count_consensus_matches_string_version).
+///
+/// # Arguments
+///   * `sequences` - Extension candidates from overlapping reads
+///   * `min_coverage` - Minimum bases required at each position
+///   * `branching_threshold` - Minor allele frequency threshold for N
+///   * `max_len` - Maximum consensus length
 #[cfg_attr(not(test), allow(dead_code))]
 fn build_consensus_sequence(
     sequences: &[String],
@@ -737,10 +737,9 @@ mod tests {
         let contigs = vec![FastaRecord { name: "c1".into(), seq: contig.to_string() }];
 
         let run = |n_reads: usize| -> String {
-            let mut cfg = ExtenderConfig::default();
-            cfg.max_consecutive_failures = 1;
+            let cfg = ExtenderConfig { max_consecutive_failures: 1, ..Default::default() };
             let mut ext = ContigExtender::new(cfg);
-            ext.reads = std::sync::Arc::new(std::iter::repeat(read.clone()).take(n_reads).collect());
+            ext.reads = std::sync::Arc::new(std::iter::repeat_n(read.clone(), n_reads).collect());
             ext.extend_contigs(&contigs).unwrap()[0].extended_seq.clone()
         };
 
@@ -792,10 +791,9 @@ mod tests {
         let read = format!("{}{}", &contig[contig.len() - 40..], ext_truth);
         let contigs = vec![FastaRecord { name: "c1".into(), seq: contig.to_string() }];
 
-        let mut cfg = ExtenderConfig::default();
-        cfg.max_consecutive_failures = 1;
+        let cfg = ExtenderConfig { max_consecutive_failures: 1, ..Default::default() };
         let mut ext = ContigExtender::new(cfg);
-        ext.reads = std::sync::Arc::new(std::iter::repeat(read.clone()).take(n_reads).collect());
+        ext.reads = std::sync::Arc::new(std::iter::repeat_n(read.clone(), n_reads).collect());
         let reads_rss = peak_rss_kb();
         let out = ext.extend_contigs(&contigs).unwrap();
         let after = peak_rss_kb();

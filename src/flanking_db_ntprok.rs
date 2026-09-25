@@ -307,7 +307,7 @@ fn download_file_once(url: &str, output_path: &Path) -> Result<()> {
             Ok(n) => {
                 file.write_all(&buffer[..n])?;
                 total += n;
-                if total % (10 * 1024 * 1024) == 0 {
+                if total.is_multiple_of(10 * 1024 * 1024) {
                     eprintln!("    Downloaded {} MB...", total / (1024 * 1024));
                 }
             }
@@ -359,7 +359,7 @@ fn run_blast_all_genes(
         .map(|(name, seq)| {
             let hits = run_blast_single(name, seq, config, &blast_cache);
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 100 == 0 || done == total {
+            if done.is_multiple_of(100) || done == total {
                 eprintln!("  BLAST progress: {}/{} genes", done, total);
             }
             hits.unwrap_or_else(|e| {
@@ -546,7 +546,7 @@ fn extract_flanking_batch(
     std::fs::create_dir_all(&temp_dir)?;
 
     let mut results: FxHashMap<String, FlankingSeqs> = FxHashMap::default();
-    let total_batches = (hits.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+    let total_batches = hits.len().div_ceil(BATCH_SIZE);
 
     eprintln!("Extracting flanking sequences ({} hits in {} batches)...", hits.len(), total_batches);
 

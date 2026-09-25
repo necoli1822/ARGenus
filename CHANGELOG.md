@@ -2,6 +2,86 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.4.1] - 2026-09-21
+
+### Added
+
+- **Align path: ARGs the assembly lost are now reported (on by default).** A gene that
+  MEGAHIT breaks across contigs fails the coverage floor and disappeared from
+  `results.tsv` entirely, even though the read→ARG alignment that selected the reads for
+  assembly had already seen it (observed for `aph(3'')-Ib` on the Abramova spike-in:
+  0.32–0.54 contig coverage against a 0.70 floor). Those genes are now emitted as
+  **align-path rows**, gated on reference breadth and read count.
+
+  These rows carry no flanking, so they are **never attributed**: `Genus`, `Species` and
+  `Context` stay `Unknown`, `Limited_By` is `no_context`, and the new `Detection_Path`
+  column marks them `align` (assembly rows are `assembly`). They must not be counted as
+  genus attributions — they say only "the gene is present, its context could not be
+  reconstructed". `Top_Matches` carries the evidence:
+  `read_only:<breadth>;alleles:<n>;support:<perfect>/<total>;margin:<lead>`. Read
+  `margin` together with `alleles` and `support` — a single surviving allele scores
+  `margin:1.00` by definition, however thin its own support.
+
+  Dedup against the assembly path is by **gene**, not reference id: PanRes holds many
+  near-identical alleles of one gene (327 TEM, 49 NDM entries), so id-level comparison
+  would re-report the same gene under a sibling allele.
+
+  New flags: `--align-path on|off` (default `on`), `--align-min-breadth` (default `0.80`),
+  `--align-min-reads` (default `10`). `--align-path off` restores 0.4.0 behaviour exactly.
+
+- **Per-variant SNP/INDEL counts from the blastn traceback.** Detection has used
+  blastn dc-megablast since 0.4.0, so each hit already carries a BTOP string; it is
+  now parsed instead of discarded. `parse_btop` walks the traceback in reference
+  coordinates (handling reverse hits where `send < sstart`) and separates
+  substitutions from gaps, counting a gap-open only on the first base of a gap run.
+  `results.tsv` gains `N_SNP`, `N_INDEL`, `INDEL_bp` and `Variants`.
+
+  On a minus-strand hit blastn prints the subject reverse-complemented, so the traceback
+  letters are the complement of the reference's own bases while the coordinates stay on
+  the plus strand. `Variants` reports both on the reference strand, so a token can be
+  compared against a point-mutation catalogue directly whichever way the contig ran.
+  Align-path rows have no traceback and report `NA`/`-`.
+
+  This exposes the evidence for point-mutation resistance genes without asserting a
+  verdict. `snp.rs` never fires on PanRes (no parseable mutation names) and CARD
+  separates homologs by curated per-gene bit-score cutoffs rather than mutation
+  lists, so the counts are reported for the user to judge.
+
+### Fixed
+
+- **`Limited_By` now says why a row is `Unknown`.** Every `Unknown` row on the
+  assembly path reported `none`, which is also what a confident single-genus call
+  reports — a row with no answer was indistinguishable from the most resolved row in
+  the file. Unknown rows now name their cause: `flank_too_short` (contig gave < 50 bp
+  of flank on both sides), `gene_not_in_reference` (the flanking DB holds nothing for
+  this gene), `context_unmatched` (the DB holds the gene but no reference flank
+  matched this sample), `alignment_failed`, and `no_flanking_db`. The align path uses
+  `no_context`; answered rows report `none`, `flank_truncated` or `flank_shared` (the
+  latter two renamed from `query`/`biology` — see Compatibility).
+
+  The causes have different remedies — deeper sequencing fixes `flank_too_short`,
+  only a larger reference fixes `gene_not_in_reference`, and `context_unmatched` may
+  indicate a host absent from the reference.
+
+### Compatibility
+
+- `results.tsv` gains **five** columns at the end — `Detection_Path`, `N_SNP`, `N_INDEL`,
+  `INDEL_bp`, `Variants` — taking the row from 24 to 29 fields. Readers that index by
+  column name are unaffected; readers that assume a fixed column count need updating.
+- **The align path adds rows by default.** A run against the same data can now report more
+  ARGs than 0.4.0 did. Every added row has `Detection_Path` = `align`, `Genus` = `Unknown`
+  and `Limited_By` = `no_context`, so filtering on any of those three reproduces the old
+  row set exactly; `--align-path off` does the same at the source. Note that align rows
+  report `ARG_Identity` `0.0` (there is no contig-vs-reference alignment to score) and put
+  reference breadth in `ARG_Coverage`, so an identity filter silently drops them.
+- **`Limited_By` on answered rows was renamed.** `query` → `flank_truncated` and
+  `biology` → `flank_shared`. The old names said how the cause was categorised rather than
+  what the reader would look for. Code matching on `"query"`/`"biology"` must be updated —
+  it will not error, it will just stop matching.
+- `Limited_By` values on `Unknown` rows change from `none` to the specific causes
+  listed above. Code that tested `limited_by == "none"` to mean "resolved" should
+  test the `Genus` column instead.
+
 ## [0.4.0] - 2026-07-17
 
 ### Added
