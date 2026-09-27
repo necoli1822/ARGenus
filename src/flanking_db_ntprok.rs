@@ -103,7 +103,6 @@ pub fn validate_arg_db_format(arg_db: &Path) -> Result<()> {
             );
         }
         "fa" | "fas" | "fasta" | "fna" => {
-            // Valid FASTA extension - verify content
             let mut file = File::open(arg_db)
                 .with_context(|| format!("Failed to open ARG database file: {}", arg_db.display()))?;
             let mut buffer = [0u8; 1];
@@ -238,22 +237,18 @@ pub fn ensure_taxdump(taxdump_dir: &Path) -> Result<()> {
     let names_path = taxdump_dir.join("names.dmp");
     let nodes_path = taxdump_dir.join("nodes.dmp");
 
-    // If both files exist, taxdump is ready
     if names_path.exists() && nodes_path.exists() {
         eprintln!("Taxdump already exists at {}", taxdump_dir.display());
         return Ok(());
     }
 
-    // Download and extract taxdump
     eprintln!("Taxdump not found. Downloading from NCBI (~60MB)...");
     std::fs::create_dir_all(taxdump_dir)?;
 
     let tar_path = taxdump_dir.join("taxdump.tar.gz");
 
-    // Download with retry
     download_file_with_retry(NCBI_TAXDUMP_URL, &tar_path)?;
 
-    // Extract
     eprintln!("  Extracting taxdump...");
     let status = Command::new("tar")
         .args(["-xzf", tar_path.to_str().unwrap(), "-C", taxdump_dir.to_str().unwrap()])
@@ -264,7 +259,6 @@ pub fn ensure_taxdump(taxdump_dir: &Path) -> Result<()> {
         anyhow::bail!("tar extraction failed");
     }
 
-    // Clean up tar file
     std::fs::remove_file(&tar_path).ok();
 
     eprintln!("  Taxdump downloaded and extracted successfully");
@@ -392,7 +386,6 @@ fn run_blast_single(
         return parse_blast_output(&result_file, gene_name);
     }
 
-    // Create temp query file
     let query_file = cache_dir.join(format!("{}.query.fa", safe_name));
     {
         let mut f = File::create(&query_file)?;
@@ -422,10 +415,8 @@ fn run_blast_single(
         anyhow::bail!("BLAST failed for {}: {}", gene_name, stderr);
     }
 
-    // Create done marker
     File::create(&done_marker)?;
 
-    // Clean up query file
     let _ = std::fs::remove_file(&query_file);
 
     parse_blast_output(&result_file, gene_name)
@@ -515,7 +506,6 @@ fn extract_accession(sseqid: &str) -> String {
             return parts[3].to_string();
         }
     }
-    // Return as-is if not gi format
     sseqid.to_string()
 }
 
@@ -555,7 +545,6 @@ fn extract_flanking_batch(
             eprintln!("  Extraction progress: batch {}/{}", batch_idx + 1, total_batches);
         }
 
-        // Create batch files for upstream and downstream extraction
         let batch_upstream = temp_dir.join(format!("batch_{}_upstream.txt", batch_idx));
         let batch_downstream = temp_dir.join(format!("batch_{}_downstream.txt", batch_idx));
 
@@ -579,7 +568,6 @@ fn extract_flanking_batch(
             }
         }
 
-        // Run blastdbcmd for upstream
         let up_output = temp_dir.join(format!("batch_{}_upstream.fa", batch_idx));
         let _ = Command::new(&config.blastdbcmd_path)
             .args([
@@ -590,7 +578,6 @@ fn extract_flanking_batch(
             ])
             .output();
 
-        // Run blastdbcmd for downstream
         let down_output = temp_dir.join(format!("batch_{}_downstream.fa", batch_idx));
         let _ = Command::new(&config.blastdbcmd_path)
             .args([
@@ -601,7 +588,6 @@ fn extract_flanking_batch(
             ])
             .output();
 
-        // Parse outputs and associate with hits
         let up_seqs = parse_blastdbcmd_output(&up_output).unwrap_or_default();
         let down_seqs = parse_blastdbcmd_output(&down_output).unwrap_or_default();
 
@@ -623,7 +609,6 @@ fn extract_flanking_batch(
             results.insert(hit_key, FlankingSeqs { upstream, downstream });
         }
 
-        // Cleanup batch files
         let _ = std::fs::remove_file(&batch_upstream);
         let _ = std::fs::remove_file(&batch_downstream);
         let _ = std::fs::remove_file(&up_output);
@@ -672,7 +657,6 @@ fn write_flanking_tsv(
         let hit_key = format!("{}:{}:{}-{}", hit.qseqid, hit.sseqid, hit.sstart, hit.send);
         let seqs = flanking_seqs.get(&hit_key).cloned().unwrap_or_default();
 
-        // Skip if no flanking sequences extracted
         if seqs.upstream.is_empty() && seqs.downstream.is_empty() {
             continue;
         }

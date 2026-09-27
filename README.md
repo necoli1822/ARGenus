@@ -290,6 +290,35 @@ Tab-delimited, one row per ARG locus (29 columns):
 | **N_SNP / N_INDEL / INDEL_bp** | Substitutions and gaps against the reference allele |
 | **Variants** | The substitutions themselves, in reference coordinates |
 
+### Align-path evidence (`Top_Matches`)
+
+An align-path row has no flanking to classify, so `Top_Matches` carries its read evidence
+instead of genus candidates:
+
+```text
+read_only:0.94;alleles:3;support:18/22;margin:0.28
+```
+
+| Field | Meaning |
+|---|---|
+| `read_only` | Reference breadth covered by reads |
+| `alleles` | Sibling alleles in this cluster that cleared the thresholds |
+| `support` | Winner's perfect-match reads / total reads on it |
+| `margin` | Winner's lead over the runner-up, **on perfect-match reads only** |
+
+`margin` measures only the separation *between sibling alleles*. It is not a confidence that
+the gene is present, nor that the winning allele is right in absolute terms:
+
+- a single surviving candidate scores `margin:1.00` by definition — there is nothing to
+  compare against — however weak its own support;
+- `margin` is undefined when the winner has zero perfect-match reads, and is also reported as
+  `1.00` in that case if it is the only candidate.
+
+`support` is what tells you a call is thin. A row reading `alleles:1;support:0/22;margin:1.00`
+means the gene is covered by reads but **no** read matches this reference exactly, so the
+allele label is a nearest neighbour, not an identification. Always read `margin` together with
+`alleles` and `support`.
+
 ### `Limited_By`
 
 On rows that called a genus:

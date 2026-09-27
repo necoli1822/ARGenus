@@ -24,7 +24,7 @@
 //!
 //! # Performance
 //! - Memory-efficient: External sort handles files larger than RAM
-//! - Compression: ~10x reduction in file size
+//! - Gene blocks are zstd-compressed and read on demand
 
 use anyhow::{Context, Result};
 use extsort_iter::*;
@@ -100,13 +100,11 @@ pub fn build(
     eprintln!("  Output: {}", fdb_path.display());
     eprintln!("  Buffer: {} MB, Threads: {}", buffer_size_mb, threads);
 
-    // Set rayon thread pool
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
         .ok(); // Ignore if already set
 
-    // Create temp directory for sort runs
     let temp_dir = tempfile::Builder::new()
         .prefix("fdb_sort_")
         .tempdir()
@@ -122,12 +120,10 @@ pub fn build(
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut lines = reader.lines();
 
-    // Read and save header
     let header = lines
         .next()
         .ok_or_else(|| anyhow::anyhow!("Empty TSV file"))??;
 
-    // Create record iterator
     let record_iter = lines.filter_map(|line_result| {
         let line = line_result.ok()?;
         if line.is_empty() {
@@ -147,7 +143,6 @@ pub fn build(
     let config = ExtsortConfig::with_buffer_size(buffer_bytes)
         .compress_lz4_flex();
 
-    // Perform parallel external sort
     let sorted_iter = record_iter
         .par_external_sort(config)
         .context("External sort failed")?;
@@ -176,7 +171,6 @@ pub fn build(
         total_records += 1;
 
         if current_gene.as_ref() != Some(&record.gene) {
-            // Write previous gene block if exists
             if let Some(prev_gene) = current_gene.take() {
                 write_gene_block(
                     &mut output,
@@ -203,7 +197,6 @@ pub fn build(
         current_records.push(record.line);
     }
 
-    // Write last gene block
     if let Some(gene) = current_gene {
         write_gene_block(
             &mut output,
@@ -241,7 +234,6 @@ pub fn build(
     // Cleanup temp directory (automatically done by tempfile)
     drop(temp_dir);
 
-    // Summary
     let input_size = file_size;
     let output_size = std::fs::metadata(fdb_path)?.len();
     let ratio = input_size as f64 / output_size as f64;
@@ -277,12 +269,10 @@ pub fn build_from_sorted(
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut lines = reader.lines();
 
-    // Read header
     let header = lines
         .next()
         .ok_or_else(|| anyhow::anyhow!("Empty TSV file"))??;
 
-    // Create output file
     let mut output = BufWriter::with_capacity(4 * 1024 * 1024, File::create(fdb_path)?);
 
     // Write header placeholder
@@ -318,9 +308,7 @@ pub fn build_from_sorted(
 
         total_records += 1;
 
-        // Check if we've moved to a new gene
         if current_gene.as_ref() != Some(&gene) {
-            // Write previous gene block
             if let Some(prev_gene) = current_gene.take() {
                 write_gene_block(
                     &mut output,
@@ -347,7 +335,6 @@ pub fn build_from_sorted(
         current_records.push(line);
     }
 
-    // Write last gene block
     if let Some(gene) = current_gene {
         write_gene_block(
             &mut output,
@@ -381,7 +368,6 @@ pub fn build_from_sorted(
     output.write_all(&index_offset.to_le_bytes())?;
     output.flush()?;
 
-    // Summary
     let output_size = std::fs::metadata(fdb_path)?.len();
     let ratio = file_size as f64 / output_size as f64;
 
@@ -413,12 +399,10 @@ fn write_gene_block(
         content.push('\n');
     }
 
-    // Compress with zstd
     let compressed = compressor.compress(content.as_bytes())?;
     let offset = output.stream_position()?;
     output.write_all(&compressed)?;
 
-    // Add to index
     index_entries.push((
         gene.to_string(),
         offset,

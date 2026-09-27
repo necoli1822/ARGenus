@@ -316,19 +316,16 @@ struct Args {
     genus_identity: f64,
 
     /// Minimum flanking identity to call SPECIES (higher than genus; species need
-    /// near-identical flanking). Set 0 to disable species reporting. Default 0.96
-    /// tuned on the low benchmark: recovers over-strict cases while keeping
-    /// chromosome-context species precision ~94%.
+    /// near-identical flanking). Set 0 to disable species reporting.
     #[arg(long = "species-identity", value_name = "F", default_value = "0.96", help_heading = "Classification")]
     species_identity: f64,
 
     /// Context call: plasmid-fraction of matched flanking >= this → "plasmid".
-    /// Tuned 0.5 on the low benchmark (plasmid calls ~95% correct).
     #[arg(long = "context-plasmid-frac", value_name = "F", default_value = "0.5", help_heading = "Classification")]
     context_plasmid_frac: f64,
 
     /// Context call: plasmid-fraction of matched flanking <= this → "chromosome".
-    /// Between the two thresholds → "ambiguous". Tuned 0.1 (chromosome ~90% correct).
+    /// Between the two thresholds → "ambiguous".
     #[arg(long = "context-chromosome-frac", value_name = "F", default_value = "0.1", help_heading = "Classification")]
     context_chromosome_frac: f64,
 
@@ -399,7 +396,7 @@ struct Args {
     #[arg(short = 'y', long, help_heading = "Runtime")]
     yes: bool,
 
-    /// Per-locus reassembly (v3 core/flank read split + SPAdes) for STALLED loci
+    /// Per-locus reassembly (core/flank read split + SPAdes) for STALLED loci
     /// (short flanking, non-plasmid). Opt-in: recovers a classifiable flanking for
     /// loci that are NA on every axis. Requires --spades-path (or the default pixi
     /// SPAdes). Plasmid-context loci are skipped (reassembly can't fix a mobile-
@@ -453,13 +450,11 @@ struct Args {
 
 /// Find executable in system PATH
 fn find_executable(name: &str) -> Result<PathBuf> {
-    // First check if it's an absolute path or in current directory
     let path = Path::new(name);
     if path.is_absolute() && path.exists() {
         return Ok(path.to_path_buf());
     }
 
-    // Search in PATH
     if let Ok(paths) = env::var("PATH") {
         for dir in env::split_paths(&paths) {
             let full_path = dir.join(name);
@@ -633,10 +628,10 @@ struct ArgHit {
     /// A percent identity hides the STRUCTURE of the difference, and for point-mutation
     /// resistance genes the structure is the whole answer: those alleles are defined by a
     /// handful of codon changes against an otherwise identical reference, so "present" means
-    /// near-zero differences. 84% identity over 3.2 kb is not a resistant allele -- it is 477
-    /// scattered substitutions plus 9 indels, i.e. another organism's homologue of the same
-    /// housekeeping gene (observed: Bifidobacterium adolescentis ileS matching the CARD
-    /// B. bifidum ileS_MUP entry). Reporting the counts lets that be seen instead of inferred.
+    /// near-zero differences. A hit carrying hundreds of scattered substitutions plus indels
+    /// is another organism's homologue of the same housekeeping gene, not a resistant allele,
+    /// however respectable its percent identity looks. Reporting the counts lets that be seen
+    /// instead of inferred.
     n_snp: usize,
     /// Gap openings vs the reference allele (indel events, not bases).
     n_indel: usize,
@@ -733,7 +728,6 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
 
     let mut file = std::fs::File::open(path)?;
 
-    // Read first 16 bytes for binary detection
     let mut header = [0u8; 16];
     let bytes_read = file.read(&mut header)?;
 
@@ -750,7 +744,6 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
         return Ok((false, true));
     }
 
-    // Validate as FASTA: reopen and parse
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -775,7 +768,6 @@ fn validate_arg_db_file(path: &Path) -> Result<(bool, bool)> {
         );
     }
 
-    // Read sequence line(s)
     let seq_line = match lines.next() {
         Some(Ok(line)) => line,
         Some(Err(e)) => anyhow::bail!("Failed to read sequence: {}", e),
@@ -834,7 +826,6 @@ fn handle_build_db(
                 }
             };
 
-            // For unified source, require --unified-db
             if source == "unified" {
                 let unified_path = unified_db.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -857,7 +848,6 @@ fn handle_build_db(
                 return arg_db::build_from_unified(output_dir, unified_path, threads);
             }
 
-            // Validate: -a should not be used with -b arg
             if arg_db.is_some() {
                 anyhow::bail!(
                     "--arg-db (-a) is not used for ARG database build.\n\
@@ -879,7 +869,6 @@ fn handle_build_db(
             arg_db::build(output_dir, source, threads)
         }
         "flank" => {
-            // Validate arg_db for flank build
             let arg_db = match arg_db {
                 Some(p) => p,
                 None => {
@@ -893,7 +882,6 @@ fn handle_build_db(
                 }
             };
 
-            // Validate that arg_db exists
             if !arg_db.exists() {
                 anyhow::bail!(
                     "AMR database not found: {}\n\
@@ -902,7 +890,6 @@ fn handle_build_db(
                 );
             }
 
-            // Validate file content using proper parsers
             let (is_fasta, is_mmi) = validate_arg_db_file(arg_db)?;
 
             if !is_fasta && !is_mmi {
@@ -914,7 +901,6 @@ fn handle_build_db(
                 );
             }
 
-            // Route based on mode
             match fdb_mode {
                 "short" => {
                     // Ensure we have a .mmi index for efficient repeated minimap2 calls
@@ -951,7 +937,6 @@ fn handle_build_db(
                         }
                     };
 
-                    // Validate email for short mode
                     let email = match email {
                         Some(e) => e,
                         None => {
@@ -1001,7 +986,6 @@ fn handle_build_db(
                     eprintln!("Note: This process takes several hours. Progress will be displayed.");
                     eprintln!();
 
-                    // Existing GenBank/PLSDB workflow (1000bp)
                     arg_db::build_flanking_db(output_dir, &arg_db, threads, email, config)
                 }
                 "long" => {
@@ -1021,7 +1005,6 @@ fn handle_build_db(
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| output_dir.join("taxonomy"));
 
-                    // Validate paths exist
                     if !blastn.exists() {
                         anyhow::bail!("blastn not found: {}", blastn.display());
                     }
@@ -1068,7 +1051,6 @@ fn handle_build_db(
             }
         }
         "fdb" => {
-            // Build FDB directly from TSV
             let tsv_path = arg_db.ok_or_else(|| {
                 anyhow::anyhow!(
                     "--arg-db is required for -b fdb (path to input TSV file).\n\
@@ -1124,12 +1106,10 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     let start_time = Instant::now();
 
-    // Auto-detect threads first (needed for build-db too)
     if args.threads == 0 {
         args.threads = num_cpus::get();
     }
 
-    // Handle --build-db mode
     if let Some(db_type) = &args.build_db {
         let config = crate::flanking_db::FlankBuildConfig {
             flanking_length: args.flanking_length,
@@ -1189,7 +1169,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Validate required arguments for analysis mode
     if args.arg_db.is_none() {
         anyhow::bail!("--arg-db is required for analysis mode (or use --db-dir)");
     }
@@ -1232,7 +1211,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Auto-detect external tools
     args.minimap2 = find_executable("minimap2")?.to_string_lossy().to_string();
 
     // Contig→ARG detection uses BLAST (dc-megablast); resolve blastn/makeblastdb the
@@ -1292,19 +1270,16 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    // Configure rayon
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build_global()
         .ok();
 
-    // Parse samples
     let samples = parse_samples(&args)?;
     if samples.is_empty() {
         anyhow::bail!("No samples provided. Use -1/-2 or --samples");
     }
 
-    // Calculate concurrent sample count
     let max_concurrent = (args.threads / args.threads_per_sample).max(1);
 
     if args.verbose {
@@ -1312,7 +1287,6 @@ fn main() -> Result<()> {
                   samples.len(), args.threads, max_concurrent, args.threads_per_sample);
     }
 
-    // Create output directory
     fs::create_dir_all(&args.outdir)?;
 
     // Process samples in parallel with semaphore-based concurrency control
@@ -1354,16 +1328,13 @@ fn main() -> Result<()> {
         }
     });
 
-    // Output results
     let final_results = Arc::try_unwrap(all_results)
         .expect("All threads should have finished")
         .into_inner()
         .unwrap();
     output_results(&final_results, &args)?;
 
-    // Cleanup temp files (keep results)
     if !args.keep_temp {
-        // Remove sample subdirectories but keep results file
         for sample in &samples {
             let sample_dir = args.outdir.join(&sample.name);
             let _ = fs::remove_dir_all(&sample_dir);
@@ -1383,7 +1354,6 @@ fn find_samples_in_dir(dir: &Path) -> Result<Vec<Sample>> {
 
     let mut sample_ids: BTreeSet<String> = BTreeSet::new();
 
-    // R1 patterns to detect sample IDs
     let r1_suffixes = ["_R1.fastq.gz", "_R1.fq.gz", "_1.fastq.gz", "_1.fq.gz",
                        "_R1.fastq", "_R1.fq", "_1.fastq", "_1.fq"];
 
@@ -1398,7 +1368,6 @@ fn find_samples_in_dir(dir: &Path) -> Result<Vec<Sample>> {
             .and_then(|n| n.to_str())
             .unwrap_or("");
 
-        // Check if this is an R1 file and extract sample ID
         for suffix in &r1_suffixes {
             if filename.ends_with(suffix) {
                 let id = filename.strip_suffix(suffix).unwrap();
@@ -1408,7 +1377,6 @@ fn find_samples_in_dir(dir: &Path) -> Result<Vec<Sample>> {
         }
     }
 
-    // Build sample list
     let mut samples = Vec::new();
     for id in sample_ids {
         let (r1, r2) = find_fastq_pair(dir, &id)?;
@@ -1459,10 +1427,8 @@ fn parse_samples(args: &Args) -> Result<Vec<Sample>> {
 
     if let Some(ref samples_path) = args.samples {
         if samples_path.is_dir() {
-            // Auto-detect FASTQ pairs in directory
             samples = find_samples_in_dir(samples_path)?;
         } else {
-            // Read sample IDs from file (one ID per line)
             let file = File::open(samples_path)
                 .with_context(|| format!("Failed to open samples file: {:?}", samples_path))?;
             let reader = BufReader::new(file);
@@ -1484,7 +1450,6 @@ fn parse_samples(args: &Args) -> Result<Vec<Sample>> {
             }
         }
     } else if let (Some(ref r1_str), Some(ref r2_str)) = (&args.r1, &args.r2) {
-        // Parse comma-separated file lists
         let r1_files: Vec<&str> = r1_str.split(',').collect();
         let r2_files: Vec<&str> = r2_str.split(',').collect();
 
@@ -1524,7 +1489,6 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
     let sample_dir = args.outdir.join(&sample.name);
     fs::create_dir_all(&sample_dir)?;
 
-    // Validate inputs
     if !sample.r1.exists() {
         anyhow::bail!("R1 file not found: {:?}", sample.r1);
     }
@@ -1602,7 +1566,6 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         c.name = format!("contig_{}", i + 1);
     }
 
-    // Write contigs for ARG detection
     let contigs_path = sample_dir.join("contigs_strict.fasta");
     write_contigs_simple(&strict_contigs, &contigs_path)?;
 
@@ -1630,14 +1593,12 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
 
     let genus_results = classify_genera(&unique_args, &strict_contigs, args)?;
 
-    // Identify unresolved ARGs (genus unknown or low confidence)
     let min_flanking_for_resolve = 100; // Need at least 100bp flanking
     let unresolved_args: Vec<&ArgHit> = unique_args.iter()
         .filter(|hit| {
             genus_results.iter()
                 .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig)
                 .map(|g| {
-                    // Unresolved if: no genus OR insufficient flanking
                     g.genus.is_none() ||
                     (g.upstream_len < min_flanking_for_resolve && g.downstream_len < min_flanking_for_resolve)
                 })
@@ -1653,7 +1614,6 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
             eprintln!("  [6/6] Extending {} unresolved contigs with Rust (flexible)...", unresolved_args.len());
         }
 
-        // Get contigs that need flexible extension
         let unresolved_contig_names: FxHashSet<String> = unresolved_args.iter()
             .map(|h| h.contig.clone())
             .collect();
@@ -1664,10 +1624,8 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
             .collect();
 
         if !contigs_to_extend.is_empty() {
-            // Apply Rust extension
             let flexible_contigs = extend_contigs_flexible(&contigs_to_extend, &filtered_r1, &filtered_r2, &sample_dir, args, shared_reads.clone())?;
 
-            // Re-classify with flexible contigs
             let flexible_genus = classify_genera(&unresolved_args.iter().map(|h| (*h).clone()).collect::<Vec<_>>(), &flexible_contigs, args)?;
 
             for result in flexible_genus {
@@ -1681,7 +1639,7 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         }
     }
 
-    // Step 6b: opt-in per-locus reassembly (v3 core/flank split) for STALLED loci.
+    // Step 6b: opt-in per-locus reassembly (core/flank split) for STALLED loci.
     // Targets loci with short flanking on both sides AND not already flagged
     // plasmid (reassembly can't fix a mobile-element genus). Recovers a
     // classifiable flanking so the 4-axis machinery can label these NA loci.
@@ -1778,7 +1736,6 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                                 }
                             }
                             for (key, mut grs) in per_locus {
-                                // best = has genus, then most flanking
                                 grs.sort_by(|a, b| {
                                     let fa = a.upstream_len + a.downstream_len;
                                     let fb = b.upstream_len + b.downstream_len;
@@ -1800,7 +1757,6 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
         }
     }
 
-    // Build result rows with extension_method
     let mut results: Vec<ResultRow> = unique_args.iter()
         .map(|hit| {
             let key = format!("{}:{}", hit.arg_name, hit.contig);
@@ -1812,7 +1768,6 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                 if flex_result.genus.is_some() {
                     (flex_result.clone(), "flexible")
                 } else {
-                    // Flexible didn't help, use strict result
                     let strict = genus_results.iter()
                         .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig)
                         .cloned()
@@ -1820,7 +1775,6 @@ fn process_sample(sample: &Sample, args: &Args) -> Result<Vec<ResultRow>> {
                     (strict, "strict")
                 }
             } else {
-                // Use strict result
                 let strict = genus_results.iter()
                     .find(|g| g.arg_name == hit.arg_name && g.contig_name == hit.contig)
                     .cloned()
@@ -1920,12 +1874,10 @@ fn classify_genera(
     contigs: &[FastaRecord],
     args: &Args,
 ) -> Result<Vec<GenusResult>> {
-    // Build contig map
     let contig_map: HashMap<String, String> = contigs.iter()
         .map(|c| (c.name.split_whitespace().next().unwrap_or(&c.name).to_string(), c.seq.clone()))
         .collect();
 
-    // Build ArgPositions
     let positions: Vec<ArgPosition> = arg_hits.iter()
         .filter_map(|hit| {
             let contig_key = hit.contig.split_whitespace().next().unwrap_or(&hit.contig);
@@ -1948,9 +1900,7 @@ fn classify_genera(
         return Ok(Vec::new());
     }
 
-    // Check if flanking database exists
     if !args.flanking_db.as_ref().unwrap().exists() {
-        // Return placeholder results if no flanking database
         if args.verbose {
             eprintln!("        Flanking database not found, skipping genus classification");
         }
@@ -2000,9 +1950,7 @@ fn classify_genera(
         return Ok(results);
     }
 
-    // Use GenusClassifier for minimap2-based classification
-    // Based on divergence analysis: intra-genus ~96% identity, inter-genus ~87%
-    // Use 90% threshold to distinguish genera
+    // Genus/species identity floors come from --genus-identity / --species-identity.
     let mut classifier = GenusClassifier::new(
         args.flanking_db.as_ref().unwrap(),
         &args.minimap2,
@@ -2038,7 +1986,6 @@ fn output_results(results: &[ResultRow], args: &Args) -> Result<()> {
 
     let excluded_count = results.len() - output_results.len();
 
-    // Output to directory/results.tsv
     let output_path = args.outdir.join("results.tsv");
     let mut output = BufWriter::new(File::create(&output_path)?);
 
@@ -2678,7 +2625,7 @@ fn sam_to_paf_builtin(sam: &Path, paf: &Path) -> Result<()> {
 /// assembly. The read->ARG alignment is computed anyway to decide which reads to hand to
 /// MEGAHIT; keeping the target side of it costs nothing and is the only way to see an ARG
 /// whose assembly broke (a contig edge can cut a gene below the -c coverage floor, so it
-/// never reaches ARG detection at all -- observed for aph(3'')-Ib on the Abramova spike-in).
+/// never reaches ARG detection at all).
 #[derive(Default)]
 struct ReadEvidence {
     /// reference length
@@ -2767,8 +2714,7 @@ fn load_arg_clusters(db_path: Option<&Path>) -> FxHashMap<String, String> {
 ///
 /// The assembly path can lose a gene entirely: if a contig edge cuts it, reference coverage
 /// falls below `-c` and it never reaches ARG detection, so it is silently absent from the
-/// report (observed for aph(3'')-Ib on the Abramova spike-in: 0.32-0.54 coverage vs a 0.70
-/// floor). The read alignment that selected reads for assembly already knows the gene is
+/// report. The read alignment that selected reads for assembly already knows the gene is
 /// there; this surfaces it instead of discarding that evidence.
 ///
 /// Rules:
@@ -2788,15 +2734,14 @@ fn build_align_rows(
     min_reads: usize,
 ) -> Vec<ResultRow> {
     let clu = |n: &str| clusters.get(n).cloned().unwrap_or_else(|| n.to_string());
-    // Cluster representatives the assembly path already covered.
     let asm_clusters: FxHashSet<String> = assembled.iter().map(|n| clu(n)).collect();
 
     // Group candidates by cluster. One real gene matches every near-identical sibling allele
     // (a TEM cluster spans 306 PanRes entries), so emitting per entry would report one gene
     // 306 times. Emit once per cluster -- but pick WHICH allele from the read evidence rather
-    // than defaulting to the cluster representative: measured on the Abramova spike-in, 60 of
-    // 65 align-path clusters have a member whose perfect-match read count leads the runner-up
-    // by >=20%, so defaulting to the representative would throw that resolution away.
+    // than defaulting to the cluster representative, which is an arbitrary member: the
+    // perfect-match read counts usually separate the siblings, and that resolution is worth
+    // keeping.
     let mut by_cluster: FxHashMap<String, Vec<String>> = FxHashMap::default();
     for name in evidence.keys() {
         let rep = clu(name);
@@ -2826,22 +2771,9 @@ fn build_align_rows(
         scored.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
         let best = scored[0].clone();
         let runner = scored.get(1).map(|x| x.2).unwrap_or(0);
-        // `margin` = how far the winning allele leads the runner-up on perfect-match reads:
-        //     (best.perfect - runner.perfect) / best.perfect
-        //
-        // It measures ONLY the separation BETWEEN sibling alleles -- it is NOT a confidence
-        // that the gene is present, and NOT a confidence that the winning allele is right in
-        // absolute terms. Two consequences worth knowing before trusting it:
-        //   * a single surviving candidate gets margin 1.00 by definition (nothing to compare
-        //     against), even if its own support is weak;
-        //   * margin is undefined when the winner has zero perfect-match reads, and is
-        //     reported as 1.00 in that case if it is also the only candidate. `support`
-        //     (perfect/total reads) is what tells you the call is thin -- e.g. a row reading
-        //     `alleles:1;support:0/22;margin:1.00` means the gene is covered by reads but NO
-        //     read matches this reference exactly, so the allele label is a nearest neighbour,
-        //     not an identification.
-        // Always read `margin` together with `alleles` and `support`; margin alone is
-        // meaningless for a single-candidate cluster.
+        // margin = (best.perfect - runner.perfect) / best.perfect, i.e. the winner's lead
+        // over the runner-up on perfect-match reads only. See "Align-path evidence" in
+        // README.md for how to read it -- it is not a confidence that the gene is present.
         let margin = if best.2 == 0 {
             if scored.len() == 1 { 1.0 } else { 0.0 }
         } else {
@@ -2868,12 +2800,7 @@ fn build_align_rows(
             upstream_len: 0,
             downstream_len: 0,
             extension_method: "none".to_string(),
-            // Carry the allele evidence so a reader can judge it:
-            //   read_only : reference breadth covered by reads
-            //   alleles   : sibling alleles in this cluster that cleared the thresholds
-            //   support   : winner's perfect-match reads / total reads on it
-            //   margin    : lead over the runner-up ON PERFECT READS ONLY (see above) --
-            //               1.00 for a single candidate, so judge it with `support`.
+            // Allele evidence for the reader; documented under "Align-path evidence" in README.
             top_matches: format!("read_only:{:.3};alleles:{};support:{}/{};margin:{:.2}",
                                  breadth, n_alleles, perfect, reads, margin),
             snp_status: "NA".to_string(),
@@ -2948,7 +2875,6 @@ fn normalize_read_name(name: &str) -> String {
 fn run_megahit(r1: &Path, r2: &Path, output_dir: &Path, megahit: &str, threads: usize) -> Result<PathBuf> {
     let megahit_dir = output_dir.join("megahit");
 
-    // MEGAHIT requires output dir to not exist
     if megahit_dir.exists() {
         fs::remove_dir_all(&megahit_dir)?;
     }
@@ -3365,12 +3291,9 @@ fn run_classify_contigs_mode(contigs_fa: &Path, args: &Args) -> Result<()> {
 
 /// Detect ARGs by aligning assembled contigs against the ARG reference FASTA with
 /// BLAST (dc-megablast), the standard for assembly-based ARG detection (ResFinder
-/// FASTA path, abricate, AMRFinderPlus all use blastn). Replaces the earlier minimap2
-/// step: minimap2 is a best-placement mapper whose chaining silently drops short genes
-/// packed in integrons/cassettes (e.g. dfrA12) and divergent hits; a benchmark over
-/// 1000+ GTDB genomes showed minimap2 recovering only ~62% (asm20) / 97% (sensitive) of
-/// BLAST's loci at equal cost. dc-megablast's spaced (discontiguous) seed keeps
-/// sensitivity across the ~80–95% cross-species regime that plain megablast misses.
+/// FASTA path, abricate, AMRFinderPlus all use blastn). dc-megablast's spaced
+/// (discontiguous) seed keeps sensitivity across the ~80–95% cross-species regime
+/// that plain megablast misses.
 ///
 /// HSPs of the same reference sitting close on a contig are merged into one locus before
 /// the coverage/identity filter, so a gene split into several HSPs is not lost. Redundant
@@ -3391,8 +3314,8 @@ fn detect_args_blast(
     let min_identity_pct = min_identity * 100.0;
     let min_coverage_pct = min_coverage * 100.0;
 
-    // Build a nucleotide BLAST DB from the ARG reference FASTA (PanRes ~0.05s). Rebuilt
-    // per run into the sample dir to avoid stale/locked shared-DB files.
+    // Build a nucleotide BLAST DB from the ARG reference FASTA. Rebuilt per run into the
+    // sample dir to avoid stale/locked shared-DB files.
     let db_prefix = output_dir.join("argdb_blast");
     let status = Command::new(makeblastdb)
         .args(["-in", arg_db_fasta.to_str().unwrap(), "-dbtype", "nucl",
@@ -3407,7 +3330,7 @@ fn detect_args_blast(
 
     // -max_target_seqs is intentionally huge: PanRes is highly redundant, so one
     // chromosome matches thousands of near-identical entries and a low cap silently
-    // truncates real genes (a low cap caused ~4x undercounting in benchmarking).
+    // truncates real genes.
     let out = output_dir.join("contigs_to_argdb.blast6");
     let perc = format!("{}", min_identity_pct);
     let status = Command::new(blastn)
@@ -3555,18 +3478,16 @@ fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
     // the LONGER alignment, then the shorter span.
     //
     // The alignment-length step is what keeps allele resolution. Identity and coverage tie
-    // constantly among the redundant PanRes representations of one gene, and the old final
-    // tiebreak ("shorter span wins") then threw away the longer, more-evidenced alignment.
-    // Observed on a real spike-in: blaNDM-1 (pan_3, 813 bp) and a 724 bp family-level "NDM"
-    // entry (pan_13066) both aligned at 100% identity / 100% coverage, and the shorter entry
-    // won -- so the report said "NDM" instead of "NDM-1". Coverage cannot separate them
-    // because it is normalised by the REFERENCE length, so any reference that aligns
-    // end-to-end scores 1.0 regardless of how much sequence it actually explains.
+    // constantly among the redundant PanRes representations of one gene -- blaNDM-1 (pan_3,
+    // 813 bp) and a 724 bp family-level "NDM" entry (pan_13066) both align at 100% identity
+    // and 100% coverage -- so without it the shorter entry can win and the report says "NDM"
+    // instead of "NDM-1". Coverage cannot separate them because it is normalised by the
+    // REFERENCE length, so any reference that aligns end-to-end scores 1.0 regardless of how
+    // much sequence it actually explains.
     //
     // Keeping identity and coverage as the first two keys (rather than replacing them with a
     // mismatch/bitscore composite) matters: a composite mixes a 1 bp allele difference with a
-    // tens-of-bp length difference and loses the allele, and measured worse here overall
-    // (genus attribution 0.914 -> 0.897 on D6331).
+    // tens-of-bp length difference and loses the allele.
     //
     // Shorter span stays the last tiebreak so a tight, gene-length allele still beats a padded
     // consensus of equal alignment length, keeping ARG_Start/End near the true gene boundary.
@@ -3607,8 +3528,8 @@ fn deduplicate_args(mut hits: Vec<ArgHit>) -> Vec<ArgHit> {
             if better(&group[i], &group[best]) { best = i; }
         }
         // Tie on the same key used to rank (score), so the members set matches what
-        // better() considers equivalent. Identity/coverage equality is no longer the
-        // ranking key and would keep a different, inconsistent set.
+        // better() considers equivalent. Identity/coverage equality is not the ranking key
+        // and would keep a different, inconsistent set.
         let (rid, rcov, ralen) = (group[best].identity, group[best].coverage, group[best].aln_len);
         let mut members: Vec<String> = Vec::new();
         for h in &group {

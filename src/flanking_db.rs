@@ -39,7 +39,6 @@ const NCBI_TAXDUMP_URL: &str = "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdum
 const NCBI_DATASETS_API: &str = "https://api.ncbi.nlm.nih.gov/datasets/v2";
 const PLSDB_META_URL: &str = "https://ccb-microbe.cs.uni-saarland.de/plsdb2025/download_meta.tar.gz";
 const PLSDB_FASTA_URL: &str = "https://ccb-microbe.cs.uni-saarland.de/plsdb2025/download_fasta";
-// Default flanking length: 1000bp (configurable via -n flag)
 const API_BATCH_SIZE: usize = 1000; // NCBI recommends <1000 per request
 
 /// PLSDB options for flanking database build
@@ -245,7 +244,6 @@ impl GenomeSizeCategory {
             GenomeSizeCategory::Medium => 6,
             GenomeSizeCategory::Large => 8,
         };
-        // Don't exceed available threads
         recommended.min(max_threads)
     }
 
@@ -332,7 +330,6 @@ impl GenomeCatalog {
             source: source.to_string(),
         };
 
-        // Index by full accession and base accession (without version)
         self.entries.insert(asm.accession.clone(), entry.clone());
         if let Some(base) = asm.accession.split('.').next() {
             self.entries.insert(base.to_string(), entry);
@@ -345,7 +342,6 @@ impl GenomeCatalog {
         plasmid: &PlasmidInfo,
         taxonomy: Option<&TaxonomyDB>,
     ) {
-        // Construct organism name from genus + species
         let organism_name = format!("{} {}", plasmid.genus, plasmid.species);
 
         // Resolve genus with smart fallback (uncultured, taxonomy, higher ranks)
@@ -361,7 +357,6 @@ impl GenomeCatalog {
             source: "plsdb".to_string(),
         };
 
-        // Index by full accession and variants
         self.entries.insert(plasmid.accession.clone(), entry.clone());
 
         // Also index by base accession (without NZ_ prefix and version)
@@ -379,19 +374,16 @@ impl GenomeCatalog {
 
     /// Look up genus by accession (tries multiple variants)
     pub fn get_genus(&self, accession: &str) -> Option<&str> {
-        // Try exact match first
         if let Some(entry) = self.entries.get(accession) {
             return Some(&entry.genus);
         }
 
-        // Try without version
         if let Some(base) = accession.split('.').next() {
             if let Some(entry) = self.entries.get(base) {
                 return Some(&entry.genus);
             }
         }
 
-        // Try without NZ_ prefix
         let stripped = accession.strip_prefix("NZ_").unwrap_or(accession);
         if let Some(entry) = self.entries.get(stripped) {
             return Some(&entry.genus);
@@ -405,13 +397,11 @@ impl GenomeCatalog {
         // Pattern: NZ_ABC123_1 -> NZ_ABC123.1
         if let Some(last_underscore) = accession.rfind('_') {
             let suffix = &accession[last_underscore + 1..];
-            // Check if suffix looks like a version number (digits only)
             if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
                 let with_dot = format!("{}.{}", &accession[..last_underscore], suffix);
                 if let Some(entry) = self.entries.get(&with_dot) {
                     return Some(&entry.genus);
                 }
-                // Also try without NZ_ prefix
                 let stripped_with_dot = with_dot.strip_prefix("NZ_").unwrap_or(&with_dot);
                 if let Some(entry) = self.entries.get(stripped_with_dot) {
                     return Some(&entry.genus);
@@ -511,21 +501,17 @@ fn resolve_genus(
     _parsed_genus: &str,
     taxonomy: Option<&TaxonomyDB>,
 ) -> String {
-    // Check for uncultured
     let organism_lower = organism_name.to_lowercase();
     if organism_lower.contains("uncultured") {
         return "uncultured".to_string();
     }
 
-    // Try taxonomy database
     if let Some(tax_db) = taxonomy {
         if let Ok(taxid) = taxid_str.parse::<u32>() {
-            // First try to get genus directly
             if let Some(genus) = tax_db.get_genus(taxid) {
                 return clean_genus(&genus);
             }
 
-            // If no genus, try to get higher rank (family, order, class)
             if let Some((name, _rank)) = tax_db.get_genus_or_higher(taxid) {
                 return clean_genus(&name);
             }
@@ -589,7 +575,6 @@ impl TaxonomyDB {
                 continue;
             }
 
-            // Only keep scientific names
             let name_class = fields[3].trim_end_matches("\t|");
             if name_class != "scientific name" {
                 continue;
@@ -674,10 +659,8 @@ impl TaxonomyDB {
         // Traverse up to 50 levels (safety limit)
         while visited < 50 {
             if let Some((parent, rank)) = self.nodes.get(&current) {
-                // Check if this rank is one we want
                 if let Some(priority) = target_ranks.iter().position(|r| r == rank) {
                     if let Some(name) = self.names.get(&current) {
-                        // Return immediately if genus found
                         if rank == "genus" {
                             return Some((name.clone(), rank.clone()));
                         }
@@ -806,7 +789,6 @@ impl FlankingDbBuilder {
         std::fs::create_dir_all(&self.output_dir)?;
         let genomes_dir = self.output_dir.join("genomes");
         std::fs::create_dir_all(&genomes_dir)?;
-        // Use user-provided PLSDB directory or create default
         let plsdb_dir = self.config.plsdb.dir.clone().unwrap_or_else(|| self.output_dir.join("plsdb"));
         if !self.config.plsdb.skip {
             std::fs::create_dir_all(&plsdb_dir)?;
@@ -816,7 +798,6 @@ impl FlankingDbBuilder {
         std::fs::create_dir_all(&temp_dir)?;
         let state_path = self.output_dir.join("build_state.json");
 
-        // Load or create build state
         let mut state = BuildState::load(&state_path).unwrap_or_else(|| {
             eprintln!("Starting fresh build...");
             BuildState::new()
@@ -832,7 +813,6 @@ impl FlankingDbBuilder {
             eprintln!();
         }
 
-        // Initialize unified catalog
         let mut catalog = GenomeCatalog::new();
         let catalog_path = self.output_dir.join("genome_catalog.tsv");
 
@@ -878,13 +858,10 @@ impl FlankingDbBuilder {
             eprintln!("[5/9] PLSDB metadata skipped");
             Vec::new()
         } else if self.config.plsdb.dir.is_some() {
-            // User provided pre-downloaded PLSDB directory
             eprintln!("[4/9] Using pre-downloaded PLSDB: {}", plsdb_dir.display());
-            // Validate required files exist
             let nuccore_csv = plsdb_dir.join("nuccore.csv");
             let fasta_path = plsdb_dir.join("sequences.fasta");
             if !nuccore_csv.exists() {
-                // Check if meta.tar.gz needs extraction
                 let meta_tar = plsdb_dir.join("meta.tar.gz");
                 if meta_tar.exists() {
                     eprintln!("    Extracting meta.tar.gz...");
@@ -909,7 +886,6 @@ impl FlankingDbBuilder {
                      plasmids.len());
             plasmids
         } else {
-            // Download from server
             if !state.is_completed("plsdb_download") {
                 state.update_step("plsdb_download");
                 state.save(&state_path)?;
@@ -929,7 +905,6 @@ impl FlankingDbBuilder {
             plasmids
         };
 
-        // Add PLSDB plasmids to catalog (with taxonomy-based genus)
         for plasmid in &standalone_plasmids {
             catalog.add_plasmid_with_taxonomy(plasmid, taxonomy.as_ref());
         }
@@ -941,7 +916,7 @@ impl FlankingDbBuilder {
         eprintln!("    Saved to: {}", catalog_path.display());
 
         // Step 7-9: Batch pipeline (download+align per batch, no combined FASTA)
-        // Saves ~350GB disk by avoiding combined FASTA
+        // Avoids materialising a combined FASTA of every genome on disk.
         let paf_output = self.output_dir.join("all_alignments.paf");
         let merged_hits = self.output_dir.join("merged_alignment_hits.tsv");
         let output_tsv = self.output_dir.join("all_flanking_sequences.tsv");
@@ -1004,7 +979,6 @@ impl FlankingDbBuilder {
                 &output_tsv,
                 &catalog,
             )?;
-            // Also extract from PLSDB (if not skipped)
             if !self.config.plsdb.skip {
                 self.extract_flanking_from_plsdb(
                     &merged_hits,
@@ -1024,7 +998,6 @@ impl FlankingDbBuilder {
             eprintln!("[7-9] Batch pipeline already completed, skipping...");
         }
 
-        // Cleanup temp directory
         if temp_dir.exists() {
             eprintln!("\nCleaning up temp files...");
             std::fs::remove_dir_all(&temp_dir).ok();
@@ -1061,8 +1034,8 @@ impl FlankingDbBuilder {
         Ok(())
     }
 
-    /// Download GenBank-only assembly summaries (bacteria + archaea)
-    /// GenBank is a superset of RefSeq with 0 FTP NA entries
+    /// Download GenBank-only assembly summaries (bacteria + archaea).
+    /// GenBank covers RefSeq, so RefSeq is not fetched or deduplicated against.
     fn download_assembly_summaries(&self) -> Result<Vec<AssemblyInfo>> {
         let mut assemblies = Vec::new();
 
@@ -1094,12 +1067,10 @@ impl FlankingDbBuilder {
         let meta_tar = plsdb_dir.join("meta.tar.gz");
         let fasta_path = plsdb_dir.join("sequences.fasta");
 
-        // Download meta archive if needed
         if !plsdb_dir.join("nuccore.csv").exists() {
             eprintln!("    Downloading PLSDB metadata...");
             self.download_file(PLSDB_META_URL, &meta_tar)?;
 
-            // Extract tar.gz
             eprintln!("    Extracting metadata...");
             let status = Command::new("tar")
                 .args(["-xzf", meta_tar.to_str().unwrap(), "-C", plsdb_dir.to_str().unwrap()])
@@ -1110,13 +1081,11 @@ impl FlankingDbBuilder {
                 anyhow::bail!("tar extraction failed");
             }
 
-            // Clean up tar file
             std::fs::remove_file(&meta_tar).ok();
         } else {
             eprintln!("    PLSDB metadata already exists, skipping download...");
         }
 
-        // Download FASTA if needed
         if !fasta_path.exists() {
             eprintln!("    Downloading PLSDB sequences (~7GB)...");
             self.download_file(PLSDB_FASTA_URL, &fasta_path)?;
@@ -1132,7 +1101,6 @@ impl FlankingDbBuilder {
         let tar_path = taxonomy_dir.join("taxdump.tar.gz");
         let names_path = taxonomy_dir.join("names.dmp");
 
-        // Skip if already extracted
         if names_path.exists() {
             eprintln!("    Taxdump already exists, skipping download...");
             return Ok(());
@@ -1140,11 +1108,9 @@ impl FlankingDbBuilder {
 
         std::fs::create_dir_all(taxonomy_dir)?;
 
-        // Download taxdump
         eprintln!("    Downloading NCBI taxdump (~60MB)...");
         self.download_file(NCBI_TAXDUMP_URL, &tar_path)?;
 
-        // Extract
         eprintln!("    Extracting taxdump...");
         let status = Command::new("tar")
             .args(["-xzf", tar_path.to_str().unwrap(), "-C", taxonomy_dir.to_str().unwrap()])
@@ -1155,7 +1121,6 @@ impl FlankingDbBuilder {
             anyhow::bail!("tar extraction failed");
         }
 
-        // Clean up tar file
         std::fs::remove_file(&tar_path).ok();
 
         Ok(())
@@ -1189,7 +1154,6 @@ impl FlankingDbBuilder {
         let mut file = File::create(output_path)?;
         let mut reader = response.into_reader();
 
-        // Stream download with progress
         let mut buffer = [0u8; 65536];
         let mut total = 0usize;
         loop {
@@ -1243,7 +1207,6 @@ impl FlankingDbBuilder {
             let accession = fields[0];
             let assembly_level = fields[11];
 
-            // Only include Complete Genome and Chromosome level
             if assembly_level != "Complete Genome" && assembly_level != "Chromosome" {
                 continue;
             }
@@ -1253,7 +1216,6 @@ impl FlankingDbBuilder {
                 continue;
             }
 
-            // Check for deduplication (GenBank vs RefSeq)
             if let Some(exclude) = exclude_set {
                 // Strip version for matching (GCA_000005845.2 -> GCA_000005845)
                 let acc_base = accession.split('.').next().unwrap_or(accession);
@@ -1271,7 +1233,6 @@ impl FlankingDbBuilder {
                 let paired_comp = fields[18];
                 if paired_asm != "na" && !paired_asm.is_empty() && paired_comp == "identical" {
                     paired_gca.push(paired_asm.to_string());
-                    // Also add without version
                     if let Some(base) = paired_asm.split('.').next() {
                         paired_gca.push(base.to_string());
                     }
@@ -1298,7 +1259,6 @@ impl FlankingDbBuilder {
         let nuccore_path = plsdb_dir.join("nuccore.csv");
         let taxonomy_path = plsdb_dir.join("taxonomy.csv");
 
-        // Load taxonomy mapping
         let mut taxonomy: FxHashMap<String, (String, String)> = FxHashMap::default();
         if taxonomy_path.exists() {
             let tax_file = File::open(&taxonomy_path)?;
@@ -1320,7 +1280,6 @@ impl FlankingDbBuilder {
             }
         }
 
-        // Load nuccore and filter
         let mut plasmids = Vec::new();
         let nuc_file = File::open(&nuccore_path)?;
         let nuc_reader = BufReader::new(nuc_file);
@@ -1331,7 +1290,6 @@ impl FlankingDbBuilder {
                 continue; // Skip header
             }
 
-            // Parse CSV with quotes handling
             let fields = parse_csv_line(&line);
             if fields.len() < 15 {
                 continue;
@@ -1372,8 +1330,8 @@ impl FlankingDbBuilder {
     }
 
     /// Batch processing: Download and align in batches without combined FASTA
-    /// Producer-consumer pattern with backpressure based on queue_buffer_gb
-    /// Saves ~350GB disk by avoiding combined FASTA
+    /// Producer-consumer pattern with backpressure based on queue_buffer_gb.
+    /// Avoids materialising a combined FASTA of every genome on disk.
     fn download_and_align_batches(
         &self,
         assemblies: &[AssemblyInfo],
@@ -1423,7 +1381,6 @@ impl FlankingDbBuilder {
                         done_set.clear();
                         std::fs::remove_file(&done_accessions_path).ok();
                     } else {
-                        // Verify genome files exist for done accessions
                         let mut missing_genomes = Vec::new();
                         for acc in &done_set {
                             let genome_path = genomes_dir.join(format!("{}.fna", acc));
@@ -1478,12 +1435,10 @@ impl FlankingDbBuilder {
         // Batch info: (batch_idx, genome_files)
         let (tx, rx) = mpsc::sync_channel::<(usize, Vec<PathBuf>)>(queue_capacity);
 
-        // Shared state for progress tracking
         let downloaded = Arc::new(AtomicUsize::new(done_set.len()));
         let aligned = Arc::new(AtomicUsize::new(done_set.len()));
         let download_error = Arc::new(AtomicBool::new(false));
 
-        // Clone necessary data for producer thread
         let genomes_dir = genomes_dir.to_path_buf();
         let temp_dir_producer = temp_dir.to_path_buf();
         let temp_dir_consumer = temp_dir.to_path_buf();
@@ -1501,7 +1456,6 @@ impl FlankingDbBuilder {
 
                 let zip_path = temp_dir_producer.join(format!("batch_{:04}.zip", batch_idx));
 
-                // Download batch via NCBI Datasets API
                 let url = format!("{}/genome/download", NCBI_DATASETS_API);
                 let acc_list: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
                 let request_body = serde_json::json!({
@@ -1517,16 +1471,13 @@ impl FlankingDbBuilder {
 
                 match response {
                     Ok(resp) => {
-                        // Save ZIP file
                         let mut zip_file = File::create(&zip_path)?;
                         let mut reader = resp.into_reader();
                         std::io::copy(&mut reader, &mut zip_file)?;
                         drop(zip_file);
 
-                        // Extract genomes to individual files
                         let genome_files = Self::extract_batch_to_files_static(&zip_path, &genomes_dir)?;
 
-                        // Clean up ZIP
                         std::fs::remove_file(&zip_path).ok();
 
                         downloaded_clone.fetch_add(batch.len(), Ordering::Relaxed);
@@ -1578,7 +1529,6 @@ impl FlankingDbBuilder {
             let buckets = bucket_genomes_by_size(&genome_files);
             let mut batch_hits: Vec<PafHit> = Vec::new();
 
-            // Process each size category with appropriate thread count
             for (category, bucket_files) in &buckets {
                 if bucket_files.is_empty() {
                     continue;
@@ -1588,7 +1538,6 @@ impl FlankingDbBuilder {
                 let bucket_suffix = format!("batch_{:04}_{:?}", batch_idx, category);
                 let bucket_fasta = temp_dir_consumer.join(format!("{}.fas", bucket_suffix));
 
-                // Create bucket FASTA with contig|filename headers
                 {
                     let mut fasta_writer = BufWriter::new(File::create(&bucket_fasta)?);
                     for genome_path in bucket_files {
@@ -1611,7 +1560,6 @@ impl FlankingDbBuilder {
                     fasta_writer.flush()?;
                 }
 
-                // Run minimap2 with adaptive thread count
                 let bucket_paf = temp_dir_consumer.join(format!("{}.paf", bucket_suffix));
                 let status = Command::new("minimap2")
                     .args([
@@ -1627,7 +1575,6 @@ impl FlankingDbBuilder {
 
                 if let Ok(s) = status {
                     if s.success() && bucket_paf.exists() {
-                        // Parse PAF hits from bucket
                         let paf_content = std::fs::read_to_string(&bucket_paf)?;
                         let hits: Vec<PafHit> = paf_content
                             .lines()
@@ -1637,12 +1584,10 @@ impl FlankingDbBuilder {
                     }
                 }
 
-                // Clean up bucket temp files
                 std::fs::remove_file(&bucket_fasta).ok();
                 std::fs::remove_file(&bucket_paf).ok();
             }
 
-            // Deduplicate combined hits from all buckets
             let dedup_hits = deduplicate_paf_hits(batch_hits);
 
             // Append deduplicated hits to main PAF and flush immediately
@@ -1668,7 +1613,6 @@ impl FlankingDbBuilder {
             let count = genome_files.len();
             aligned.fetch_add(count, Ordering::Relaxed);
 
-            // Log with bucket distribution
             let bucket_info: Vec<String> = buckets.iter()
                 .map(|(cat, files)| format!("{}={}", cat.name().split_whitespace().next().unwrap_or("?"), files.len()))
                 .collect();
@@ -1678,7 +1622,6 @@ impl FlankingDbBuilder {
                      aligned.load(Ordering::Relaxed), total_accessions);
         }
 
-        // Wait for producer
         let _ = producer.join();
 
         Ok(aligned.load(Ordering::Relaxed))
@@ -1700,7 +1643,6 @@ impl FlankingDbBuilder {
                     let filename = format!("{}.fna", acc_dir);
                     let output_path = genomes_dir.join(&filename);
 
-                    // Extract to file
                     let mut content = Vec::new();
                     file.read_to_end(&mut content)?;
                     std::fs::write(&output_path, &content)?;
@@ -1728,7 +1670,6 @@ impl FlankingDbBuilder {
             return Ok(0);
         }
 
-        // Build set of accessions to extract
         let target_accs: FxHashSet<_> = plasmids.iter()
             .map(|p| p.accession.clone())
             .collect();
@@ -1738,7 +1679,6 @@ impl FlankingDbBuilder {
             return Ok(0);
         }
 
-        // Process in batches
         let acc_list: Vec<_> = target_accs.iter().collect();
         let batches: Vec<_> = acc_list.chunks(API_BATCH_SIZE).collect();
         let total_batches = batches.len();
@@ -1747,7 +1687,6 @@ impl FlankingDbBuilder {
         eprintln!("    Processing {} PLSDB plasmids in {} batches...",
                  target_accs.len(), total_batches);
 
-        // Open source FASTA and build index for random access
         let file = File::open(&fasta_path)?;
         let reader = BufReader::new(file);
 
@@ -1780,7 +1719,6 @@ impl FlankingDbBuilder {
 
         eprintln!("    Loaded {} target sequences from PLSDB", seq_map.len());
 
-        // Process batches with adaptive thread bucketing
         for (batch_idx, batch) in batches.iter().enumerate() {
             // Bucket sequences by size for adaptive thread allocation
             let mut size_buckets: FxHashMap<GenomeSizeCategory, Vec<(&str, &str)>> = FxHashMap::default();
@@ -1797,7 +1735,6 @@ impl FlankingDbBuilder {
 
             let mut batch_hits: Vec<PafHit> = Vec::new();
 
-            // Process each size category with appropriate thread count
             for (category, bucket_seqs) in &size_buckets {
                 if bucket_seqs.is_empty() {
                     continue;
@@ -1807,7 +1744,6 @@ impl FlankingDbBuilder {
                 let bucket_suffix = format!("plsdb_batch_{:04}_{:?}", batch_idx, category);
                 let bucket_fasta = temp_dir.join(format!("{}.fas", bucket_suffix));
 
-                // Create bucket FASTA with contig|filename headers
                 {
                     let mut fasta_writer = BufWriter::new(File::create(&bucket_fasta)?);
                     for (acc, seq) in bucket_seqs {
@@ -1818,7 +1754,6 @@ impl FlankingDbBuilder {
                     fasta_writer.flush()?;
                 }
 
-                // Run minimap2 with adaptive thread count
                 let bucket_paf = temp_dir.join(format!("{}.paf", bucket_suffix));
                 let status = Command::new("minimap2")
                     .args([
@@ -1834,7 +1769,6 @@ impl FlankingDbBuilder {
 
                 if let Ok(s) = status {
                     if s.success() && bucket_paf.exists() {
-                        // Parse PAF hits from bucket
                         let paf_content = std::fs::read_to_string(&bucket_paf)?;
                         let hits: Vec<PafHit> = paf_content
                             .lines()
@@ -1844,15 +1778,12 @@ impl FlankingDbBuilder {
                     }
                 }
 
-                // Clean up bucket temp files
                 std::fs::remove_file(&bucket_fasta).ok();
                 std::fs::remove_file(&bucket_paf).ok();
             }
 
-            // Deduplicate combined hits from all buckets
             let dedup_hits = deduplicate_paf_hits(batch_hits);
 
-            // Append deduplicated hits to main PAF
             {
                 let mut paf_file = std::fs::OpenOptions::new()
                     .create(true)
@@ -1865,7 +1796,6 @@ impl FlankingDbBuilder {
 
             total_processed += batch.len();
 
-            // Log with bucket distribution
             let bucket_info: Vec<String> = size_buckets.iter()
                 .map(|(cat, seqs)| format!("{}={}", cat.name().split_whitespace().next().unwrap_or("?"), seqs.len()))
                 .collect();
@@ -1900,12 +1830,10 @@ impl FlankingDbBuilder {
         let hits_file = File::open(hits_path)?;
         let reader = BufReader::new(hits_file);
 
-        // Group hits by genome file (only PLSDB files)
         let mut plsdb_hits: FxHashMap<String, Vec<(String, String, usize, usize)>> = FxHashMap::default();
 
         for (i, line) in reader.lines().enumerate() {
             let line = line?;
-            // Skip header
             if i == 0 && line.starts_with("gene") {
                 continue;
             }
@@ -1920,14 +1848,12 @@ impl FlankingDbBuilder {
             let start: usize = fields[2].parse().unwrap_or(0);
             let end: usize = fields[3].parse().unwrap_or(0);
 
-            // Parse contig_id|filename format
             let (contig_id, genome_file) = if let Some(pipe_pos) = contig_file.rfind('|') {
                 (contig_file[..pipe_pos].to_string(), contig_file[pipe_pos + 1..].to_string())
             } else {
                 continue;
             };
 
-            // Only process PLSDB files (NZ_*, CP*, etc.)
             if genome_file.starts_with("NZ_") || genome_file.starts_with("CP") ||
                genome_file.starts_with("AP") || genome_file.starts_with("NC_") {
                 plsdb_hits.entry(genome_file)
@@ -1940,7 +1866,6 @@ impl FlankingDbBuilder {
             return Ok(());
         }
 
-        // Append to output file
         let mut writer = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1954,7 +1879,6 @@ impl FlankingDbBuilder {
                 continue;
             }
 
-            // Load genome sequences
             let sequences = match self.load_genome_sequences(&genome_path) {
                 Ok(seqs) => seqs,
                 Err(_) => continue,
@@ -1981,10 +1905,8 @@ impl FlankingDbBuilder {
                     continue;
                 }
 
-                // Get genus
                 let genus = base_genus.clone().unwrap_or_else(|| "Unknown".to_string());
 
-                // Extract flanking sequences
                 let upstream_start = start.saturating_sub(self.config.flanking_length);
                 let upstream = &contig_seq[upstream_start..*start];
 
@@ -2030,7 +1952,6 @@ impl FlankingDbBuilder {
             }
         }
 
-        // Write output
         let mut writer = BufWriter::new(File::create(output_path)?);
         for (gene, contig_file, start, end) in &hits {
             writeln!(writer, "{}\t{}\t{}\t{}", gene, contig_file, start, end)?;
@@ -2050,7 +1971,6 @@ impl FlankingDbBuilder {
         output_path: &Path,
         catalog: &GenomeCatalog,
     ) -> Result<()> {
-        // Skip if output already exists and is non-empty
         if output_path.exists() {
             let metadata = std::fs::metadata(output_path)?;
             if metadata.len() > 0 {
@@ -2069,7 +1989,6 @@ impl FlankingDbBuilder {
 
         for (i, line) in reader.lines().enumerate() {
             let line = line?;
-            // Skip header
             if i == 0 && line.starts_with("gene") {
                 continue;
             }
@@ -2084,7 +2003,6 @@ impl FlankingDbBuilder {
             let start: usize = fields[2].parse().unwrap_or(0);
             let end: usize = fields[3].parse().unwrap_or(0);
 
-            // Parse contig_id|filename format
             let (contig_id, genome_file) = if let Some(pipe_pos) = contig_file.rfind('|') {
                 (contig_file[..pipe_pos].to_string(), contig_file[pipe_pos + 1..].to_string())
             } else {
@@ -2097,11 +2015,9 @@ impl FlankingDbBuilder {
                 .push((gene.to_string(), contig_id, start, end));
         }
 
-        // Process each genome and extract flanking sequences
         let output_file = File::create(output_path)?;
         let mut writer = BufWriter::new(output_file);
 
-        // Write header
         writeln!(writer, "Gene\tContig\tGenus\tStart\tEnd\tUpstream\tDownstream")?;
 
         let total_genomes = genome_hits.len();
@@ -2116,13 +2032,11 @@ impl FlankingDbBuilder {
                 continue;
             }
 
-            // Load genome sequences
             let sequences = match self.load_genome_sequences(&genome_path) {
                 Ok(seqs) => seqs,
                 Err(_) => continue,
             };
 
-            // Build a map for quick contig lookup
             let seq_map: FxHashMap<&str, &str> = sequences.iter()
                 .map(|(header, seq)| {
                     let key = header.split_whitespace().next().unwrap_or(header.as_str());
@@ -2130,13 +2044,10 @@ impl FlankingDbBuilder {
                 })
                 .collect();
 
-            // Try to get genus from genome filename (accession)
             let genome_acc = genome_file.trim_end_matches(".fna");
             let base_genus = catalog.get_genus(genome_acc).map(|s| s.to_string());
 
-            // Extract flanking for each hit
             for (gene, contig_id, start, end) in hits {
-                // Look up contig sequence
                 let contig_seq = match seq_map.get(contig_id.as_str()) {
                     Some(seq) => *seq,
                     None => continue,
@@ -2144,7 +2055,6 @@ impl FlankingDbBuilder {
 
                 let contig_len = contig_seq.len();
 
-                // Bounds check
                 if *start >= contig_len || *end > contig_len || start >= end {
                     continue;
                 }

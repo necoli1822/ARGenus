@@ -141,7 +141,6 @@ fn extract_flanking_from_genome(
     catalog: &GenomeCatalog,
     flanking_length: usize,
 ) -> Result<Vec<FlankingEntry>> {
-    // Read genome FASTA
     let file = File::open(genome_path)?;
     let reader = BufReader::new(file);
 
@@ -166,17 +165,14 @@ fn extract_flanking_from_genome(
         contigs.insert(id, current_seq);
     }
 
-    // Get genus from catalog
     let genome_file = genome_path.file_name().unwrap().to_str().unwrap();
     let genus = catalog.get_genus(genome_file).to_string();
 
-    // Extract flanking for each hit
     let mut entries = Vec::new();
     for hit in hits {
         if let Some(seq) = contigs.get(&hit.contig_id) {
             let seq_len = seq.len();
 
-            // Bounds check
             if hit.query_start >= seq_len || hit.query_end > seq_len {
                 continue;
             }
@@ -255,7 +251,6 @@ fn build_mmi_index(fasta_path: &Path, mmi_path: &Path) -> Result<bool> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse arguments
     let mut paf_path: Option<PathBuf> = None;
     let mut genomes_dir: Option<PathBuf> = None;
     let mut catalog_path: Option<PathBuf> = None;
@@ -311,7 +306,6 @@ fn main() -> Result<()> {
     let catalog_path = catalog_path.context("Missing -c/--catalog argument")?;
     let output_dir = output_dir.context("Missing -o/--output argument")?;
 
-    // Create output directory if needed
     std::fs::create_dir_all(&output_dir)?;
 
     let fdb_path = output_dir.join("flanking_db.tsv");
@@ -327,7 +321,6 @@ fn main() -> Result<()> {
     eprintln!("Threads: {}", threads);
     eprintln!();
 
-    // Set thread pool
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()?;
@@ -398,14 +391,12 @@ fn main() -> Result<()> {
 
     eprintln!();
 
-    // Write FDB (TSV) and FASTA simultaneously
     eprintln!("\n    Writing FDB and FASTA...");
     let fdb_file = File::create(&fdb_path)?;
     let fasta_file = File::create(&fasta_path)?;
     let mut fdb_writer = BufWriter::new(fdb_file);
     let mut fasta_writer = BufWriter::new(fasta_file);
 
-    // FDB header
     writeln!(fdb_writer, "Gene\tContig\tGenus\tStart\tEnd\tStrand\tSequence")?;
 
     let mut total_written = 0usize;
@@ -413,7 +404,6 @@ fn main() -> Result<()> {
 
     for entries in results {
         for entry in entries {
-            // Write FDB entry
             writeln!(
                 fdb_writer,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -469,7 +459,6 @@ fn main() -> Result<()> {
 
     let elapsed = start_time.elapsed().as_secs_f64();
 
-    // Summary
     eprintln!();
     eprintln!("=== Complete ===");
     eprintln!("Time: {:.1}s", elapsed);

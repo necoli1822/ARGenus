@@ -2,6 +2,43 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.4.2] - 2026-09-27
+
+Documentation only — no behaviour change. The 0.4.2 binary is functionally identical to 0.4.1.
+
+### Changed
+
+- **Removed benchmark figures that had no reproducible source.** The `detect_args_blast`
+  comment claimed minimap2 recovered "~62% (asm20) / 97% (sensitive)" of BLAST's loci over
+  1000+ GTDB genomes, and that minimap2's chaining "silently drops short genes packed in
+  integrons/cassettes". Neither holds up. Re-measuring the same comparison with multiple
+  placements allowed (`-N 200 -p 0.05 --secondary=yes`) gives locus recovery of 91.6% (asm20)
+  and 92.4% (sr) against 99.5% for blastn dc-megablast; the original figures came from
+  `--secondary=no`, which keeps one placement per query and therefore cannot count loci for a
+  gene present in several genomes. The loci actually missed were longer, not shorter. The
+  rationale for dc-megablast now rests on its own merits.
+
+  The same class of claim is gone throughout: defaults described as "tuned on the low
+  benchmark", per-dataset numbers ("60 of 65 …", "~4x undercounting", "0.914 → 0.897 on
+  D6331", "~26x slower", "~10x compression", "~94% NCBI mapping"), and a pointer to a private
+  project note. Where such a comment also carried a real design reason, the reason stayed and
+  only the unsupported measurement went.
+
+- **`classifier.rs` module documentation described the pre-0.4.0 algorithm** — "score genus
+  candidates based on alignment identity and coverage / report top genus" — two releases
+  after that was replaced by the phylogenetic kernel posterior and the conformal credible
+  set. It now describes what the module actually does.
+
+- **Removed ~310 comments that restated the line below them** (`// Save last sequence`,
+  `// Parse FASTA`, `// Rate limiting`). Format specifications, magic-number justifications,
+  worked examples, ordering constraints and pipeline step labels were kept.
+
+- **Moved the `Top_Matches` / `margin` reading guide from `main.rs` into README**
+  ("Align-path evidence"), where someone reading that TSV column will find it.
+
+- Version-history asides in comments ("was X before 0.4.0", "the old tiebreak …") were
+  dropped — this file is the record of that.
+
 ## [0.4.1] - 2026-09-21
 
 ### Added

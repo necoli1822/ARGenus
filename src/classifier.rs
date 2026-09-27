@@ -8,12 +8,15 @@
 //! 1. Extract upstream and downstream flanking sequences from contig
 //! 2. Query the flanking database for the detected ARG
 //! 3. Align query flanking sequences against reference flanking sequences
-//! 4. Score genus candidates based on alignment identity and coverage
-//! 5. Report top genus with confidence and specificity metrics
+//! 4. Turn per-genus likelihoods into a phylogenetic kernel posterior over genera
+//! 5. Report the conformal credible set, its resolution rank/taxon, and what limited it
 //!
 //! # Key Metrics
-//! - **Confidence**: Alignment identity score (0-100%)
+//! - **Confidence**: Mean flanking alignment identity of the call (0-100%)
 //! - **Specificity**: Gene-genus association strength in the database (0-100%)
+//! - **Support**: Posterior mass of the reported credible set
+//!
+//! See the `results.tsv` section of README.md for the reported columns.
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;
@@ -147,9 +150,7 @@ pub struct GenusResult {
     pub resolution_distance: f64,
     /// Why resolution stopped. When a genus WAS called: "none" (single genus),
     /// "flank_truncated" (the contig edge cut the flank short) or "flank_shared" (full
-    /// flank recovered, but the context is genuinely shared across genera). The last two
-    /// were named "query"/"biology" up to and including v0.4.0; those said what the cause
-    /// was categorised as, not what a reader would look for in the output.
+    /// flank recovered, but the context is genuinely shared across genera).
     ///
     /// When Genus is Unknown this says why, and the reasons are not interchangeable:
     /// "no_context" (align-path row — no contig, so context was never attempted),
@@ -158,9 +159,7 @@ pub struct GenusResult {
     /// of sequencing fixes it), "context_unmatched" (the DB holds the gene but none of
     /// its reference flanks matched this sample — a novel or absent host),
     /// "alignment_failed" (minimap2 errored) and "no_flanking_db" (run without a DB).
-    /// Before this change every one of these reported "none", which also means
-    /// "confidently one genus" — so a row with no answer was indistinguishable from the
-    /// most confident row in the file.
+    /// They are distinct from "none", which means "confidently one genus".
     pub limited_by: String,
     /// Ragged rank of the answer: the LCA rank of the credible set (species/genus/family/
     /// …/root). This is the taxonomic level at which the ARG's context is actually shared.
@@ -264,7 +263,6 @@ impl FlankingDatabase {
         let mut file = File::open(path.as_ref())
             .with_context(|| format!("Failed to open fdb: {}", path.as_ref().display()))?;
 
-        // Read and verify header
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
         if &magic != FDB_MAGIC {
@@ -283,7 +281,6 @@ impl FlankingDatabase {
         file.read_exact(&mut buf8)?;
         let index_offset = u64::from_le_bytes(buf8);
 
-        // Read index from end of file
         file.seek(SeekFrom::Start(index_offset))?;
         let mut index = FxHashMap::default();
 
@@ -330,7 +327,6 @@ impl FlankingDatabase {
     /// Checks if a gene exists in the database.
     /// First tries direct key lookup, then falls back to gene name mapping.
     pub fn has_gene(&self, gene: &str) -> bool {
-        // Try direct lookup first
         if self.index.contains_key(gene) {
             return true;
         }
@@ -343,7 +339,6 @@ impl FlankingDatabase {
     /// Decompresses the gene block on demand.
     /// Supports both direct key lookup and gene name mapping (e.g., "mexQ" -> "mexQ|DRUG|CLASS|CODE").
     pub fn get_gene_records(&self, gene: &str) -> Result<Vec<FlankingRecord>> {
-        // Try direct lookup, then gene name mapping
         let lookup_key = if self.index.contains_key(gene) {
             gene.to_string()
         } else if let Some(full_key) = self.gene_name_to_key.get(gene) {
@@ -360,15 +355,12 @@ impl FlankingDatabase {
         let mut compressed = vec![0u8; entry.compressed_len as usize];
         self.file.read_exact_at(&mut compressed, entry.offset)?;
 
-        // Decompress with zstd
         let decompressed = zstd::decode_all(&compressed[..])?;
         let content = String::from_utf8(decompressed)?;
 
-        // Parse TSV content
         let mut records = Vec::with_capacity(entry.record_count as usize);
         let mut lines = content.lines();
 
-        // Skip header line
         let _header = lines.next();
 
         for line in lines {
@@ -420,7 +412,7 @@ fn ou_lookup(neighbors: &FxHashMap<String, FxHashMap<String, f64>>, a: &str, b: 
 /// Distance assigned when a genus pair is absent from the GTDB patristic table. Set beyond the
 /// inter-domain median (~2.76 subs/site) so an absent relative contributes ≈0 kernel weight
 /// (exp(-3/λ) with λ=0.3 ≈ 5e-5): "unknown neighbor" is treated as "maximally far", never as a
-/// close borrow. (Was 1.0 on the old mash scale where distances saturated near 0.34.)
+/// close borrow.
 const ABSENT_PATRISTIC: f64 = 3.0;
 
 /// Phylogenetic OU-kernel posterior over genera from per-genus likelihoods.
@@ -464,7 +456,7 @@ fn ou_posterior(
 /// genera and ten close ones are different answers even at the same family. Scaled to the GTDB
 /// patristic table (genus-pair median ≈0.19, family-pair median ≈0.60), so 0.5 sits just below
 /// the family diameter: within-family sisters list individually; a set spilling past one family
-/// rolls up to its LCA. (Was 0.12 on the old mash scale, which saturated near 0.30 at family.)
+/// rolls up to its LCA.
 const GENUS_COHERENCE_RADIUS: f64 = 0.5;
 
 /// Renders the credible set's resolution notation. The credible set itself is the answer
@@ -850,13 +842,11 @@ impl GenusClassifier {
         recs_by_gene: &FxHashMap<String, Vec<FlankingRecord>>,
         dist_by_gene: &FxHashMap<String, FxHashMap<String, usize>>,
     ) -> Result<GenusResult> {
-        // Extract flanking sequences
         let (upstream, downstream) = self.extract_flanking_regions(pos);
 
         let upstream_len = upstream.len();
         let downstream_len = downstream.len();
 
-        // Verify SNP for point mutation genes
         let snp_status = snp::verify_snp(
             &pos.contig_seq,
             &pos.arg_name,
@@ -867,7 +857,6 @@ impl GenusClassifier {
             pos.strand,
         );
 
-        // Require minimum flanking for classification
         if upstream_len < 50 && downstream_len < 50 {
             return Ok(GenusResult {
                 arg_name: pos.arg_name.clone(),
@@ -980,7 +969,6 @@ impl GenusClassifier {
         let ref_path = temp_dir.join(format!("argenus_ref_{}_{}.fas", pid, idx));
         let paf_path = temp_dir.join(format!("argenus_align_{}_{}.paf", pid, idx));
 
-        // Write query FASTA
         {
             let mut query_file = BufWriter::new(File::create(&query_path)?);
             if !upstream.is_empty() {
@@ -1019,7 +1007,6 @@ impl GenusClassifier {
             .context("Failed to run minimap2")?;
 
         if !output.status.success() {
-            // Cleanup and return error result
             let _ = std::fs::remove_file(&query_path);
             let _ = std::fs::remove_file(&ref_path);
             let _ = std::fs::remove_file(&paf_path);
@@ -1055,7 +1042,6 @@ impl GenusClassifier {
         let (genus_likelihood, genus_confidence, plasmid_frac, species_scores) =
             self.calculate_genus_scores(&paf_path)?;
 
-        // Cleanup temporary files
         let _ = std::fs::remove_file(&query_path);
         let _ = std::fs::remove_file(&ref_path);
         let _ = std::fs::remove_file(&paf_path);
@@ -1083,9 +1069,8 @@ impl GenusClassifier {
         }
         let total_in_db: usize = genus_dist.values().sum();
 
-        // Determine best genus via the phylogenetic OU-kernel posterior (replaces the
-        // old count-weighted identity score). `sorted_scores` now holds (genus, posterior)
-        // in descending posterior order; DB depth no longer biases the ranking.
+        // Determine best genus via the phylogenetic OU-kernel posterior. `sorted_scores`
+        // holds (genus, posterior) in descending posterior order.
         let sorted_scores: Vec<(String, f64)> = self.kernel_posterior(&genus_likelihood);
 
         let (genus, confidence, specificity) = if let Some((best_genus, _post)) = sorted_scores.first() {
@@ -1219,7 +1204,6 @@ impl GenusClassifier {
     fn extract_flanking_regions(&self, pos: &ArgPosition) -> (String, String) {
         let seq = &pos.contig_seq;
 
-        // Extract upstream (before ARG)
         let upstream_end = pos.arg_start;
         let upstream_start = upstream_end.saturating_sub(self.max_flanking);
         let upstream = if upstream_end > upstream_start {
@@ -1228,7 +1212,6 @@ impl GenusClassifier {
             String::new()
         };
 
-        // Extract downstream (after ARG)
         let downstream_start = pos.arg_end;
         let downstream_end = (downstream_start + self.max_flanking).min(seq.len());
         let downstream = if downstream_end > downstream_start {
@@ -1237,7 +1220,6 @@ impl GenusClassifier {
             String::new()
         };
 
-        // Handle reverse strand
         if pos.strand == '-' {
             (reverse_complement(&downstream), reverse_complement(&upstream))
         } else {
@@ -1312,8 +1294,8 @@ impl GenusClassifier {
         }
 
         // Per-genus mean likelihood (kernel input) and mean identity (confidence). The
-        // likelihood is averaged WITHIN genus so DB depth (many flanks of one genus) can
-        // no longer inflate the score — the old count bonus did exactly that.
+        // likelihood is averaged WITHIN genus so DB depth (many flanks of one genus) does
+        // not inflate the score.
         let tau = self.kernel_tau;
         let mut genus_likelihood: FxHashMap<String, f64> = FxHashMap::default();
         let mut genus_confidence: FxHashMap<String, f64> = FxHashMap::default();

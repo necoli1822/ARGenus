@@ -253,21 +253,17 @@ pub fn verify_snp(
     contig_end: usize,
     strand: char,
 ) -> SnpStatus {
-    // Parse SNP info from gene name
     let snp_info = match parse_snp_info(gene_name) {
         Some(info) => info,
         None => return SnpStatus::NotApplicable,
     };
 
-    // Calculate nucleotide position of SNP in reference
     let (snp_nt_start, snp_nt_end) = snp_info.nucleotide_range();
 
-    // Check if SNP position is covered by alignment
     if snp_nt_start < ref_start || snp_nt_end > ref_end {
         return SnpStatus::NotCovered;
     }
 
-    // Calculate corresponding position in contig
     let offset_in_ref = snp_nt_start - ref_start;
     let contig_snp_start = if strand == '+' {
         contig_start + offset_in_ref
@@ -277,12 +273,10 @@ pub fn verify_snp(
     };
     let contig_snp_end = contig_snp_start + 3;
 
-    // Check bounds
     if contig_snp_end > contig_seq.len() {
         return SnpStatus::NotCovered;
     }
 
-    // Extract codon from contig
     let codon_seq = &contig_seq[contig_snp_start..contig_snp_end];
 
     // Handle reverse strand - need reverse complement
@@ -292,13 +286,11 @@ pub fn verify_snp(
         codon_seq.to_uppercase()
     };
 
-    // Translate codon
     let amino_acid = match translate_codon(&codon) {
         Some(aa) => aa,
         None => return SnpStatus::Unverified(format!("invalid_codon:{}", codon)),
     };
 
-    // Compare with expected
     if amino_acid == snp_info.mutant {
         SnpStatus::Confirmed
     } else if amino_acid == snp_info.wildtype {

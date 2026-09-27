@@ -1,7 +1,6 @@
-//! Per-locus reassembly (v3 core/flank read split) — opt-in via `--reassemble`.
+//! Per-locus reassembly (core/flank read split) — opt-in via `--reassemble`.
 //!
-//! Rationale (validated in the low-depth ablation, see project memory
-//! `perlocus-reassembly-and-emit`): reads that align >=70% of their length to the
+//! Rationale: reads that align >=70% of their length to the
 //! ARG are the shared, conserved *core* that BRIDGES different genomes' flanking
 //! during assembly and collapses them into chimeras. If we split reads per-mate,
 //! drop pairs where both mates are core, keep the flanking mate of a half-core pair
@@ -245,7 +244,6 @@ fn split_reads(
             npair[l] += 1;
         }
     }
-    // flush
     drop(w1); drop(w2); drop(ws);
     Ok((0..loci.len()).map(|i| (npair[i] > 0, nsing[i] > 0)).collect())
 }

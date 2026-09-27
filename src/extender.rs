@@ -174,7 +174,6 @@ impl ContigExtender {
         let k = self.config.kmer_size;
         let max_failures = self.config.max_consecutive_failures;
 
-        // Use Arc<Mutex> for thread-safe state updates
         let states: Vec<Mutex<ContigState>> = contigs.iter().map(|c| {
             Mutex::new(ContigState {
                 name: c.name.clone(),
@@ -191,7 +190,6 @@ impl ContigExtender {
 
         loop {
             rounds += 1;
-            // Identify contigs that still need extension
             let active_indices: Vec<usize> = states.iter().enumerate()
                 .filter(|(_, s)| {
                     let s = s.lock().unwrap();
@@ -204,7 +202,6 @@ impl ContigExtender {
                 break;
             }
 
-            // Build edge k-mer index for active contigs
             let mut edge_kmers: FxHashMap<u64, Vec<(usize, bool, usize)>> = FxHashMap::default();
 
             for &idx in &active_indices {
@@ -214,7 +211,6 @@ impl ContigExtender {
                     continue;
                 }
 
-                // Index left edge k-mers
                 if state.left_failures < max_failures {
                     for offset in 0..self.config.num_edge_kmers.min(seq.len() - k + 1) {
                         if let Some(hash) = compute_kmer_hash(&seq[offset..offset+k]) {
@@ -223,7 +219,6 @@ impl ContigExtender {
                     }
                 }
 
-                // Index right edge k-mers
                 if state.right_failures < max_failures {
                     let seq_len = seq.len();
                     for offset in 0..self.config.num_edge_kmers.min(seq.len() - k + 1) {
@@ -243,8 +238,8 @@ impl ContigExtender {
 
             // Stream all reads (no index): metagenomic reads have mostly-distinct
             // k-mers, so building a read index costs far more (tens of millions of
-            // per-k-mer allocations) than it saves — measured ~26x slower. The
-            // allocation-free streaming scan is the right structure here.
+            // per-k-mer allocations) than it saves. The allocation-free streaming scan
+            // is the right structure here.
             self.reads.par_iter().for_each(|read_seq| {
                 scan_read(read_seq, &edge_kmers, &states, k, max_len,
                           &left_candidates, &right_candidates);
@@ -253,13 +248,11 @@ impl ContigExtender {
             let left_candidates = left_candidates.into_inner().unwrap();
             let right_candidates = right_candidates.into_inner().unwrap();
 
-            // Parallel extension application
             let any_extended = std::sync::atomic::AtomicBool::new(false);
 
             active_indices.par_iter().for_each(|&idx| {
                 let mut state = states[idx].lock().unwrap();
 
-                // Try left extension
                 if state.left_failures < max_failures {
                     if let Some(counts) = left_candidates.get(&idx) {
                         let consensus = build_consensus_from_counts(
@@ -292,7 +285,6 @@ impl ContigExtender {
                     }
                 }
 
-                // Try right extension
                 if state.right_failures < max_failures {
                     if let Some(counts) = right_candidates.get(&idx) {
                         let consensus = build_consensus_from_counts(
@@ -336,7 +328,6 @@ impl ContigExtender {
             contigs.len(), rounds, self.reads.len(), t_start.elapsed().as_secs_f64()
         );
 
-        // Convert states to results
         let results = states.into_iter().map(|s| {
             let s = s.into_inner().unwrap();
             ExtendedContig {
@@ -609,7 +600,6 @@ fn build_consensus_sequence(
     let mut result = String::new();
 
     for i in 0..actual_max_len {
-        // Collect bases at this position
         let bases: Vec<char> = sequences
             .iter()
             .filter_map(|s| s.chars().nth(i))
@@ -620,7 +610,6 @@ fn build_consensus_sequence(
             break;
         }
 
-        // Count base frequencies
         let mut counts = [0usize; 4]; // A, T, G, C
         for &b in &bases {
             match b.to_ascii_uppercase() {
@@ -644,7 +633,6 @@ fn build_consensus_sequence(
         let second_count = sorted_counts[1];
         let minor_freq = second_count as f64 / total as f64;
 
-        // Determine consensus base
         let base = if minor_freq >= branching_threshold {
             'N' // Ambiguous position
         } else {

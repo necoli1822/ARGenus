@@ -74,7 +74,6 @@ impl FastaReader {
             current_name: None,
         };
 
-        // Read first header line to initialise state
         reader.line_buf.clear();
         if reader.reader.read_line(&mut reader.line_buf)? > 0
             && reader.line_buf.starts_with('>') {
@@ -107,7 +106,6 @@ impl FastaReader {
         loop {
             self.line_buf.clear();
             if self.reader.read_line(&mut self.line_buf)? == 0 {
-                // End of file reached
                 break;
             }
 
