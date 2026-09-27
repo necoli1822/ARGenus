@@ -60,7 +60,14 @@ A targeted assembly pipeline that:
   4. Detects ARGs and classifies source genus using flanking sequences
 
 WORKFLOW:
-  Reads → read filter (strobealign/minimap2/bwa-mem2) → MEGAHIT assembly → Extension → ARG detection → Genus classification
+  Reads → read filter (strobealign/minimap2/bwa-mem2) → MEGAHIT assembly → Extension
+        → ARG detection (blastn dc-megablast) → Genus classification (minimap2)
+
+REQUIRED ON PATH:
+  blastn, makeblastdb   ARG detection (BLAST+); also required with --classify-contigs
+  minimap2              flanking classification, and read filter with --mapper minimap2
+  megahit               assembly (not needed with --classify-contigs)
+  strobealign           default read filter (not needed with --mapper minimap2/bwa-mem2)
 
 ALIGNMENT TIE-BREAKING (for equal-score hits):
   Priority: Score (higher first) → Gene length (higher first) → MapQ (higher first)
@@ -172,11 +179,12 @@ struct Args {
     #[arg(long = "mode", value_name = "MODE", default_value = "short", help_heading = "Database")]
     fdb_mode: String,
 
-    /// Path to blastn executable (required for --mode long)
+    /// Path to blastn executable. Overrides the blastn auto-detected for contig→ARG
+    /// detection, and is required for `--build-db --mode long`.
     #[arg(long = "blastn-path", value_name = "PATH", help_heading = "Database")]
     blastn_path: Option<PathBuf>,
 
-    /// Path to blastdbcmd executable (required for --mode long)
+    /// Path to blastdbcmd executable (required for `--build-db --mode long` only)
     #[arg(long = "blastdbcmd-path", value_name = "PATH", help_heading = "Database")]
     blastdbcmd_path: Option<PathBuf>,
 
@@ -1225,8 +1233,8 @@ fn main() -> Result<()> {
         eprintln!("Found makeblastdb: {}", args.makeblastdb);
     }
 
-    // --classify-contigs only needs minimap2 (detection + classification); skip the
-    // assembly/mapper toolchain and the read pipeline entirely.
+    // --classify-contigs needs BLAST (detection, resolved above) and minimap2
+    // (classification); skip the assembly/mapper toolchain and the read pipeline entirely.
     if let Some(contigs_fa) = args.classify_contigs.clone() {
         if args.verbose { eprintln!("Found minimap2: {}", args.minimap2); }
         return run_classify_contigs_mode(&contigs_fa, &args);

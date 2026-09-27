@@ -2,6 +2,50 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.4.3] - 2026-09-28
+
+Documentation only. The single code change is the `--help` text; no logic, output column or
+default is touched.
+
+### Fixed
+
+- **README listed BLAST+ as optional; it is required for every run.** The "External tools"
+  section put BLAST+ under *"Only for opt-in features — not needed for a standard run"* and
+  described it as *"only to build the 5,000 bp (`--mode long`) flanking DB; never used at run
+  time, and unnecessary with the pre-built database"*. That has been wrong since 0.4.0, when
+  contig→ARG detection moved to blastn dc-megablast. ARGenus resolves `blastn` and
+  `makeblastdb` at startup and aborts if either is missing, so anyone who installed only the
+  tools the README called mandatory could not run it at all.
+
+  What was wrong:
+  - BLAST+ (`blastn`, **`makeblastdb`**) is required for every analysis run, `--classify-contigs`
+    included — the tool resolution happens before that mode branches off, and the mode calls the
+    BLAST detector itself. The README named `blastdbcmd`, which the detection path never uses.
+  - `blastdbcmd` is the opt-in one: only for building the 5,000 bp (`--mode long`) flanking DB,
+    and it is passed explicitly via `--blastdbcmd-path` rather than found on `PATH`.
+  - minimap2 no longer performs ARG detection. It does flanking alignment for
+    genus/species classification, and read filtering when `--mapper minimap2`.
+  - MEGAHIT and strobealign are needed for the read pipeline but not for `--classify-contigs`.
+
+  `--build-db` is unaffected: it returns before the run-time tools are resolved, so building a
+  database does not need `blastn` on `PATH`.
+
+- **Requirements are now one `Dependencies` section instead of a subsection of `Installation`.**
+  Build toolchain (Rust 1.88+, which the dependency tree already requires), a table of every
+  external executable — what needs it, what it is used for, and its `--*-path` override — and a
+  pointer to the databases, all in one place ahead of the install instructions. The scattered
+  layout is why a wrong entry survived three releases. The table also documents `bwa-mem2`,
+  `paftools.sh` (optional; a built-in SAM→PAF converter is used when absent) and `spades.py`,
+  none of which were listed before, and records that `minimap2`, `makeblastdb` and `megahit`
+  have no path override and must be on `PATH`.
+
+- **`--help` now lists the required executables** under `REQUIRED ON PATH`, and the workflow
+  line names the aligner used at each step, so the requirement is visible where users hit it.
+
+- **`--blastn-path` help text said only "required for --mode long"**; it also overrides the
+  blastn used for detection. The in-source comment claiming `--classify-contigs` "only needs
+  minimap2" was likewise wrong and has been corrected.
+
 ## [0.4.2] - 2026-09-27
 
 Documentation only — no behaviour change. The 0.4.2 binary is functionally identical to 0.4.1.

@@ -84,6 +84,44 @@ Also new:
 - **Compact database**: custom FDB format (zstd-compressed, on-demand gene blocks)
 - **Scales with depth**: bounded extension memory; multi-threaded
 
+## Dependencies
+
+Nothing is vendored. ARGenus needs a Rust toolchain to build, a few external aligners on
+`PATH` at run time, and two databases.
+
+### Build
+
+Rust **1.88** or newer — the dependency tree already requires it.
+
+### External tools
+
+Resolved at startup by searching `PATH`. If a required one is missing ARGenus aborts with
+`<tool> not found in PATH` before doing any work.
+
+| Tool | Needed for | Role | Path override |
+|---|---|---|---|
+| **`blastn`** + **`makeblastdb`** (BLAST+) | **every run**, `--classify-contigs` included | contig→ARG detection (`dc-megablast`) | `--blastn-path` (blastn only) |
+| **`minimap2`** | **every run** | flanking alignment for genus/species classification; also the read filter under `--mapper minimap2` | — |
+| `megahit` | the read pipeline (not `--classify-contigs`) | assembly of the filtered reads | — |
+| `strobealign` | `--mapper strobealign` (**default**) | read filtering (Step 1) | `--strobealign-path` |
+| `bwa-mem2` | `--mapper bwa-mem2` | read filtering (Step 1) | `--bwa-mem2-path` |
+| `paftools.sh` | optional | SAM→PAF for strobealign / bwa-mem2; a built-in converter is used when absent | `--paftools-path` |
+| `spades.py` | `--reassemble` | per-locus reassembly | `--spades-path` |
+| `blastdbcmd` | `--build-db --mode long` only | pulling 5,000 bp flanks out of `nt_prok` | `--blastdbcmd-path` |
+
+So a standard read run needs **blastn, makeblastdb, minimap2, megahit and strobealign**;
+`--classify-contigs` needs only **blastn, makeblastdb and minimap2**.
+
+`--build-db` looks up none of the above — it returns before the run-time tools are resolved.
+Building the 5,000 bp flanking DB (`--mode long`) instead takes `blastn` and `blastdbcmd` from
+`--blastn-path` / `--blastdbcmd-path`, which are mandatory there and are **not** searched on
+`PATH`.
+
+### Data
+
+An ARG reference FASTA and a flanking `.fdb`; neither ships with the crate. See
+[Databases](#databases) for the pre-built download or how to build your own.
+
 ## Installation
 
 ### From crates.io
@@ -99,17 +137,6 @@ git clone https://github.com/necoli1822/ARGenus.git
 cd ARGenus
 cargo build --release
 ```
-
-### External tools (must be on `PATH`)
-
-Required to run ARGenus on reads:
-- [minimap2](https://github.com/lh3/minimap2) — alignment for ARG detection **and** flanking classification (always used)
-- [MEGAHIT](https://github.com/voutcn/megahit) — assembly of the filtered reads
-- [strobealign](https://github.com/ksahlin/strobealign) — the **default** read filter; not needed if you run `--mapper minimap2`
-
-Only for opt-in features — **not** needed for a standard run:
-- [SPAdes](https://github.com/ablab/spades) — only for `--reassemble`
-- [BLAST+](https://blast.ncbi.nlm.nih.gov/) (`blastn`, `blastdbcmd`) — only to *build* the 5,000 bp (`--mode long`) flanking DB; never used at run time, and unnecessary with the pre-built database below
 
 ## Databases
 
