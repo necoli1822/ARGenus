@@ -2,6 +2,30 @@
 
 All notable changes to ARGenus will be documented in this file.
 
+## [0.4.4] - 2026-09-28
+
+### Changed
+
+- **Declared `rust-version = "1.88"`.** 0.4.3's README states Rust 1.88+, but nothing
+  enforced it: on an older toolchain the build failed somewhere inside a dependency instead
+  of saying why. The floor is not a choice — the dependency tree (`icu_*`, `time`) already
+  requires 1.88 — so declaring it only turns a confusing failure into
+  `package requires rustc 1.88`. This is the one behavioural change here: cargo now refuses
+  older toolchains up front.
+
+- **Removed unsourced accuracy figures from the 0.4.0 and 0.4.1 entries and the README.**
+  0.4.2 stripped this class of claim from the source comments but left it in the release
+  notes. The 0.4.0 entry quoted per-dataset accuracy (Zymo / GTDB / RAPID / Bracken /
+  ResFinder golden) and the 0.4.1 entry a per-sample coverage range; neither run is
+  reproducible from this repository, so a reader had no way to check either. The substance of
+  both entries — what changed and why — is unaffected and stayed.
+
+  The 0.2.0 entry got the same treatment: the `Coverage` / `Genus Resolution` columns and the
+  throughput claims (`sub-millisecond per ARG match`, `~700 MB peak memory`, `5-10 minutes per
+  sample`, `8-16 GB RAM for 190+ GB datasets`) are gone, while the record and gene counts and
+  the measured `194 GB → 8.7 GB` compression stayed — those can be checked against the shipped
+  databases. Past entries were edited rather than annotated in place, which this note records.
+
 ## [0.4.3] - 2026-09-28
 
 Documentation only. The single code change is the `--help` text; no logic, output column or
@@ -90,9 +114,9 @@ Documentation only — no behaviour change. The 0.4.2 binary is functionally ide
 - **Align path: ARGs the assembly lost are now reported (on by default).** A gene that
   MEGAHIT breaks across contigs fails the coverage floor and disappeared from
   `results.tsv` entirely, even though the read→ARG alignment that selected the reads for
-  assembly had already seen it (observed for `aph(3'')-Ib` on the Abramova spike-in:
-  0.32–0.54 contig coverage against a 0.70 floor). Those genes are now emitted as
-  **align-path rows**, gated on reference breadth and read count.
+  assembly had already seen it — a contig edge can cut the gene below the `-c` coverage
+  floor. Those genes are now emitted as **align-path rows**, gated on reference breadth
+  and read count.
 
   These rows carry no flanking, so they are **never attributed**: `Genus`, `Species` and
   `Context` stay `Unknown`, `Limited_By` is `no_context`, and the new `Detection_Path`
@@ -179,11 +203,10 @@ Documentation only — no behaviour change. The 0.4.2 binary is functionally ide
 ### Changed
 
 - **Kernel-posterior genus/family classification.** Reworked the phylogenetic-context
-  scoring toward a posterior over lineages. Validated with no regression and net
-  improvement: Zymo genus-wrong 5.8→4.3%, GTDB (7,077 genomes) family 91.1→92.2% /
-  genus-wrong 14.4→12.6%, RAPID (775 MAGs) detection 98.7% byte-identical with host
-  Bracken corroboration 90.3→93.4%. Detection specificity unchanged (ResFinder golden:
-  recall 99.9%, ARG-negative specificity 99.5%).
+  scoring toward a posterior over lineages, so a sparse genus borrows evidence from close
+  relatives instead of losing to a deeply-sampled one. Detection was unaffected.
+  (This entry originally quoted per-dataset accuracy figures; they were removed in 0.4.4
+  because the runs behind them are not reproducible from this repository.)
 
 ## [0.3.1] - 2026-07-12
 
@@ -242,13 +265,13 @@ Documentation only — no behaviour change. The 0.4.2 binary is functionally ide
 ### Added
 
 - **Dual database mode**: New `--mode short|long` option for flanking database building
-  - `short` mode (1,000 bp): High coverage (97.6%) from GenBank + PLSDB
-  - `long` mode (5,000 bp): High resolution (92.8%) from NCBI nt_prok
+  - `short` mode (1,000 bp): broader gene coverage, from GenBank + PLSDB
+  - `long` mode (5,000 bp): finer genus resolution, from NCBI nt_prok
 - **New source file**: `flanking_db_ntprok.rs` for 5,000 bp database construction using BLASTN
 - **Streaming FDB builder**: Memory-efficient processing for large datasets
   - `--sorted` flag for pre-sorted input (streaming mode)
   - External merge sort support
-  - Works with 8-16 GB RAM for 190+ GB datasets
+  - Keeps peak memory bounded regardless of input size
 - **Auto-download taxdump**: Automatic download of NCBI taxonomy files if not present
 
 ### Changed
@@ -261,16 +284,15 @@ Documentation only — no behaviour change. The 0.4.2 binary is functionally ide
 
 ### Database Statistics
 
-| Database | Records | Genes | Coverage | Genus Resolution |
-|----------|---------|-------|----------|------------------|
-| 1,000 bp | 1,069,848 | 11,835 | 97.6% | 83.9% |
-| 5,000 bp | 23,184,244 | 11,092 | 91.5% | 92.8% |
+| Database | Records | Genes |
+|----------|---------|-------|
+| 1,000 bp | 1,069,848 | 11,835 |
+| 5,000 bp | 23,184,244 | 11,092 |
 
 ### Performance
 
-- Database query: sub-millisecond per ARG match
-- FDB building: ~700 MB peak memory (streaming mode)
-- Processing: 5-10 minutes per sample (16 threads)
+- Gene blocks are indexed for O(1) random access, so a query touches one block
+- The streaming FDB builder holds one gene block at a time rather than the whole input
 
 ## [0.1.5] - 2026-02-06
 

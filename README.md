@@ -37,9 +37,10 @@ you how much to trust that link.
   separately and the kernel constants always match the table scale they were calibrated
   to. A `genus_dist.tsv` / `genus_lineage.tsv` / `conformal.tsv` in the db dir still
   overrides the embedded copy.
-- **Kernel-posterior genus/family classification.** Zymo genus-wrong 5.8→4.3%, GTDB
-  (7,077 genomes) family 91.1→92.2% / genus-wrong 14.4→12.6%, RAPID (775 MAGs) detection
-  98.7% byte-identical. Detection specificity unchanged.
+- **Kernel-posterior genus/family classification.** Genus/family scoring became a
+  posterior over lineages rather than a count-weighted identity score, so a sparse genus
+  borrows evidence from close relatives instead of losing to a deeply-sampled one.
+  Detection itself is unchanged.
 
 ## What's new in 0.3.1
 
